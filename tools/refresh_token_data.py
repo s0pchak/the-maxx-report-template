@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -61,6 +62,47 @@ class UsageEvent:
 
 def get_local_tz() -> ZoneInfo:
     return ZoneInfo(os.environ.get("DASHBOARD_TIMEZONE") or DEFAULT_TIMEZONE)
+
+
+def normalize_owner_handle(value: str | None) -> str | None:
+    if not value:
+        return None
+    handle = value.strip().lstrip("@")
+    if not handle:
+        return None
+    return handle.split("/", 1)[0].strip() or None
+
+
+def owner_from_github_url(value: str | None) -> str | None:
+    if not value:
+        return None
+    match = re.search(r"github\.com[:/]([^/\s:]+)/[^/\s]+?(?:\.git)?/?$", value.strip())
+    return normalize_owner_handle(match.group(1)) if match else None
+
+
+def infer_owner_handle() -> str | None:
+    explicit = normalize_owner_handle(os.environ.get("DASHBOARD_OWNER_HANDLE"))
+    if explicit:
+        return explicit
+
+    github_repository = normalize_owner_handle(os.environ.get("GITHUB_REPOSITORY"))
+    if github_repository:
+        return github_repository
+
+    try:
+        result = subprocess.run(
+            ["git", "config", "--get", "remote.origin.url"],
+            cwd=DASHBOARD_ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+
+    if result.returncode != 0:
+        return None
+    return owner_from_github_url(result.stdout)
 
 
 def parse_source_dirs(value: str | None, defaults: list[SourceDir], env_label: str) -> list[SourceDir]:
@@ -519,6 +561,7 @@ def build_usage() -> dict:
     return {
         "schemaVersion": 2,
         "generatedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "ownerHandle": infer_owner_handle(),
         "timezone": str(local_tz),
         "sourceDirs": [source.label for source in codex_sources if source.path.exists()] + (
             [claude_source.label] if claude_source.path.exists() else []

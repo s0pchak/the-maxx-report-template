@@ -1,5 +1,6 @@
 const usage = window.AI_TOKEN_USAGE || window.CODEX_TOKEN_USAGE || {
   generatedAt: null,
+  ownerHandle: null,
   firstDate: null,
   lastDate: null,
   timezone: "America/New_York",
@@ -36,7 +37,9 @@ const modelColors = new Map();
 });
 
 const els = {
-  generatedAt: document.querySelector("#generatedAt"),
+  generatedDate: document.querySelector("#generatedDate"),
+  generatedTime: document.querySelector("#generatedTime"),
+  ownerHandle: document.querySelector("#ownerHandle"),
   totalTokens: document.querySelector("#totalTokens"),
   dateSpan: document.querySelector("#dateSpan"),
   todayTokens: document.querySelector("#todayTokens"),
@@ -136,6 +139,28 @@ function formatGenerated(value) {
     hour: "numeric",
     minute: "2-digit",
   }).format(new Date(value));
+}
+
+function formatGeneratedDate(value) {
+  if (!value) return "--";
+  return new Intl.DateTimeFormat("en-US", {
+    month: "short",
+    day: "numeric",
+  }).format(new Date(value));
+}
+
+function formatGeneratedTime(value) {
+  if (!value) return "--";
+  return new Intl.DateTimeFormat("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(new Date(value));
+}
+
+function ownerHandleLabel(value) {
+  const handle = String(value || "").trim().replace(/^@+/, "");
+  if (!handle) return "";
+  return `@${handle}`;
 }
 
 function durationLabel(seconds = 0) {
@@ -541,7 +566,13 @@ function updateSummary() {
   const topModel = (usage.models || [])[0];
   const totalTokens = Number(usage.totals?.totalTokens || 0);
 
-  setText(els.generatedAt, formatGenerated(usage.generatedAt));
+  setText(els.generatedDate, formatGeneratedDate(usage.generatedAt));
+  setText(els.generatedTime, formatGeneratedTime(usage.generatedAt));
+  const ownerHandle = ownerHandleLabel(usage.ownerHandle);
+  if (els.ownerHandle) {
+    setText(els.ownerHandle, ownerHandle);
+    els.ownerHandle.hidden = !ownerHandle;
+  }
   setText(els.totalTokens, compactNumber(totalTokens));
   setText(els.dateSpan, `${formatDateLong(usage.firstDate)} to ${formatDateLong(usage.lastDate)}`);
   setText(els.todayTokens, latest ? compactNumber(latest.totalTokens) : "--");

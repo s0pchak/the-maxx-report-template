@@ -29,10 +29,17 @@
       <header class="hero">
         <div class="hero-copy">
           <p class="eyebrow">The Maxx Report</p>
-          <h1><span id="heroTotal">--</span> tokens</h1>
+          <div class="hero-title">
+            <h1><span id="heroTotal">--</span> tokens</h1>
+            <span class="hero-owner" id="ownerHandle" hidden></span>
+          </div>
           <div class="hero-actions">
             <p class="hero-tagline">Count tokens. Question choices.</p>
-            <span class="hero-updated">Updated <strong id="generatedAt">--</strong></span>
+            <span class="hero-updated">
+              <span class="hero-updated-label">Updated</span>
+              <span class="hero-updated-date" id="generatedDate">--</span>
+              <strong id="generatedTime">--</strong>
+            </span>
           </div>
         </div>
       </header>

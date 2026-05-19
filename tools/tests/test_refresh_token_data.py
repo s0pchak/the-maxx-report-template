@@ -123,6 +123,7 @@ class RefreshTokenDataTest(unittest.TestCase):
 
         expected_fields = {
             "generatedAt",
+            "ownerHandle",
             "timezone",
             "firstDate",
             "lastDate",
@@ -152,6 +153,20 @@ class RefreshTokenDataTest(unittest.TestCase):
             {"gpt-5.1-codex-mini": "Codex", "claude-sonnet-4-5": "Claude Code"},
         )
         self.assert_no_absolute_fixture_paths(usage, root)
+
+    def test_owner_handle_helpers(self):
+        self.assertEqual(
+            refresh_token_data.owner_from_github_url("git@github.com:s0pchak/the-maxx-report.git"),
+            "s0pchak",
+        )
+        self.assertEqual(
+            refresh_token_data.owner_from_github_url("https://github.com/example-user/the-maxx-report.git"),
+            "example-user",
+        )
+        self.assertIsNone(refresh_token_data.owner_from_github_url("https://gitlab.com/example/repo.git"))
+
+        with patched_env({"DASHBOARD_OWNER_HANDLE": "@receipt-maxxer"}):
+            self.assertEqual(refresh_token_data.infer_owner_handle(), "receipt-maxxer")
 
     def test_main_writes_ai_usage_and_legacy_alias(self):
         with tempfile.TemporaryDirectory() as tmp:

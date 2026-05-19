@@ -130,6 +130,7 @@ The importer/update tooling can be configured with environment variables:
 - `DASHBOARD_CODEX_DIRS`: comma-separated Codex transcript directories to scan. Defaults should cover the normal local Codex session locations.
 - `DASHBOARD_CLAUDE_PROJECTS_DIR`: Claude Code projects directory to scan. Use this when Claude Code data lives outside the default location.
 - `DASHBOARD_TIMEZONE`: IANA timezone used for daily grouping, such as `America/New_York`.
+- `DASHBOARD_OWNER_HANDLE`: GitHub handle shown beside the big token total. Defaults to the owner from `origin` when it points at GitHub.
 - `DASHBOARD_REMOTE`: Git remote used by the updater when pushing. Defaults to `origin`.
 - `DASHBOARD_COMMIT_MESSAGE`: commit message used for generated data updates.
 
@@ -137,6 +138,7 @@ Example:
 
 ```bash
 DASHBOARD_TIMEZONE=America/Los_Angeles maxxreport --no-push
+DASHBOARD_OWNER_HANDLE=your-handle maxxreport --no-push
 ```
 
 ## Render Hosting
