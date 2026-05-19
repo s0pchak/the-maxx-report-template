@@ -61,27 +61,29 @@ If you make your fork public, inspect `data/usage.json` before pushing. The dash
 
 5. Create a Render static site from your repo. The included `render.yaml` keeps the site static and serves the committed bundle, no daemon, no server, no laptop hostage situation.
 
-## Make It Yours With An Agent
+## Have An Agent Finish The Fork
 
-This is the part where you burn a few more tokens to make the token dashboard about burning tokens. Civilization may not recover, but at least the bars will line up.
+This is the part where you burn a few more tokens so your agent can wire up the fork, run the importer, and get the thing hosted without turning the README into a treasure map.
 
 After cloning your fork, give your coding agent a prompt like:
 
 ```text
-Make this dashboard feel like my personal AI usage command center.
-Keep the existing data importer and update workflow intact.
-Rename the project, adjust the hero copy, tune the colors, and make the graph
-and model breakdown look polished enough to send to friends as evidence.
-Do not publish private usage data. Keep sample data in public repos.
-Run the existing tests and a browser smoke before committing.
+I forked The Maxx Report and want it running with my own local AI usage data.
+Read the README, install the maxxreport shortcut, run the importer locally, and
+help me deploy it as a static site.
+
+Keep the data importer and update workflow intact. Do not publish private usage
+data to a public repo. If this repo is public, use sample or sanitized data.
+Set DASHBOARD_OWNER_HANDLE if my GitHub handle is not inferred correctly.
+Run the existing tests and a local browser smoke before committing.
 ```
 
-Good customization targets:
+Good setup targets:
 
-- `index.html` for product name and hero copy.
-- `styles.css` for visual treatment.
-- `app.js` for labels, chart annotations, and tooltip copy.
-- `README.md` for your fork's setup instructions.
+- `tools/update_dashboard.sh` for the update cycle.
+- `tools/install_dashboard_shortcut.sh` for the `maxxreport` command.
+- `data/usage.json` and `data/usage.js` for the generated bundle.
+- `render.yaml` for static hosting.
 
 Avoid changing `tools/refresh_token_data.py` unless you are adding a real provider or fixing importer behavior.
 
@@ -143,6 +145,14 @@ Example:
 DASHBOARD_TIMEZONE=America/Los_Angeles maxxreport --no-push
 DASHBOARD_OWNER_HANDLE=your-handle maxxreport --no-push
 ```
+
+## Showing Your GitHub Handle
+
+The dashboard writes `ownerHandle` into `data/usage.json` when you run the updater.
+
+- If your `origin` remote is a GitHub repo, the owner is inferred automatically.
+- If you want a different handle, run `DASHBOARD_OWNER_HANDLE=your-handle maxxreport`.
+- Commit and push the regenerated `data/usage.json` and `data/usage.js`, then your hosted page will show `@your-handle` beside the token total.
 
 ## Render Hosting
 

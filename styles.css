@@ -1573,21 +1573,51 @@ h1 {
   overflow-wrap: anywhere;
 }
 
+.hero-tagline-row {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+}
+
+.repo-link {
+  display: inline-grid;
+  width: 22px;
+  height: 22px;
+  color: var(--ink);
+  opacity: 0.88;
+  place-items: center;
+  transition: opacity 160ms ease, transform 160ms ease;
+}
+
+.repo-link:hover,
+.repo-link:focus-visible {
+  opacity: 1;
+  transform: translateY(-1px);
+}
+
+.repo-link svg {
+  width: 21px;
+  height: 21px;
+  display: block;
+  fill: currentColor;
+}
+
 .hero-updated-label {
   margin-right: 4px;
 }
 
 .hero-updated-date {
-  color: color-mix(in srgb, var(--ink) 72%, transparent);
-  font-size: clamp(14px, 1.35vw, 20px);
-  font-weight: 700;
-  margin-right: 8px;
+  color: inherit;
+  font-size: inherit;
+  font-weight: inherit;
+  margin-right: 4px;
 }
 
 .hero-updated #generatedTime {
-  color: var(--ink);
-  font-size: clamp(24px, 3vw, 44px);
-  font-weight: 800;
+  color: inherit;
+  font-size: inherit;
+  font-weight: inherit;
 }
 
 .hero-receipts {
@@ -1707,6 +1737,10 @@ h1 {
   .hero-actions {
     align-items: start;
     justify-content: start;
+  }
+
+  .hero-tagline-row {
+    justify-content: flex-start;
   }
 
   .hero-tagline {
