@@ -1,29 +1,44 @@
-# AI Token Dashboard
+# The Maxx Report
 
-Static dashboard for local AI coding-assistant token usage. It is designed to be forked or used as a GitHub template, then hosted as a static site after you generate and commit your own `data/usage.json` and `data/usage.js` bundle.
+Local telemetry for extremely normal AI usage.
 
-The dashboard is intended for Codex and Claude Code local usage data. It is a local estimate from local assistant logs, not provider billing truth.
+Count tokens. Question choices.
 
-## Privacy and Data Policy
+Are you even token maxxing, bro?
+
+The Maxx Report is a static dashboard for local AI coding-assistant token usage. It reads local Codex and Claude Code transcript logs, bundles the result into `data/usage.json` and `data/usage.js`, and lets any static host serve the dashboard while your laptop is offline.
+
+It is a local usage estimate, not OpenAI, Anthropic, or Render billing truth.
+
+## What It Shows
+
+- Total tokens across logged days.
+- Stacked daily token bars by model.
+- Session length overlay by day.
+- Tokens and call counts by model.
+- Provider labels for Codex and Claude Code.
+- Hover details for the day you are inspecting.
+
+## Privacy Model
 
 This repository serves whatever is committed under `data/`.
 
 - A private live repo can hold your real generated `data/usage.*` bundle.
-- A public template repo should ship only sample or sanitized data. Do not publish someone else's private generated bundle.
+- A public template repo should ship only sample or sanitized data.
 - Static hosting serves the committed `data/usage.json` and `data/usage.js` files.
-- Render and other cloud static-site builds do not read your laptop logs. The build only checks that the committed data bundle exists.
-- Running the updater locally is the step that reads local Codex or Claude Code logs and regenerates the committed bundle.
+- Render and other static-site builds do not read your laptop logs.
+- Running the updater locally is the only step that reads local Codex or Claude Code logs.
 
 If you make your fork public, inspect `data/usage.json` before pushing.
 
 ## Quickstart
 
-1. Create your copy from the GitHub template or fork this repository.
+1. Create your own copy from the GitHub template or fork.
 2. Clone your copy locally.
 
    ```bash
-   git clone git@github.com:YOUR_USER/ai-token-dashboard.git
-   cd ai-token-dashboard
+   git clone git@github.com:YOUR_USER/the-maxx-report.git
+   cd the-maxx-report
    ```
 
 3. Generate your dashboard data.
@@ -42,7 +57,31 @@ If you make your fork public, inspect `data/usage.json` before pushing.
 
 5. Create a Render static site from your repo. The included `render.yaml` keeps the site static and serves the committed bundle.
 
-## Install the Shortcut
+## Make It Yours With An Agent
+
+This is the part where you burn a few more tokens to make the token dashboard about burning tokens.
+
+After cloning your fork, give your coding agent a prompt like:
+
+```text
+Make this dashboard feel like my personal AI usage command center.
+Keep the existing data importer and update workflow intact.
+Rename the project, adjust the hero copy, tune the colors, and make the graph
+and model breakdown look polished on desktop and mobile.
+Do not publish private usage data. Keep sample data in public repos.
+Run the existing tests and a browser smoke before committing.
+```
+
+Good customization targets:
+
+- `index.html` for product name and hero copy.
+- `styles.css` for visual treatment.
+- `app.js` for labels, chart annotations, and tooltip copy.
+- `README.md` for your fork's setup instructions.
+
+Avoid changing `tools/refresh_token_data.py` unless you are adding a real provider or fixing importer behavior.
+
+## Install The Shortcut
 
 Install or update the local `dashboard` command from this checkout:
 
@@ -115,7 +154,13 @@ The cloud build does not run the local importer and does not read `~/.codex`, Cl
 
 Open `index.html` directly in a browser, or serve the directory with any static file server.
 
-## Publishing a Template
+```bash
+python3 -m http.server 8768 --bind 127.0.0.1
+```
+
+Then open `http://127.0.0.1:8768/`.
+
+## Publishing A Template
 
 Before publishing a template repo:
 
@@ -125,4 +170,4 @@ Before publishing a template repo:
 
 ## Scope
 
-This dashboard summarizes local transcript usage events. It is useful for personal trend tracking, model mix review, and rough assistant-usage visibility. It is not OpenAI, Anthropic, or Render billing truth.
+This dashboard summarizes local transcript usage events. It is useful for personal trend tracking, model mix review, and rough assistant-usage visibility. It is not account billing truth.

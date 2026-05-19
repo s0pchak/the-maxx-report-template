@@ -245,6 +245,18 @@ h2 {
   min-width: 0;
 }
 
+.hero-tagline {
+  min-width: 0;
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: clamp(15px, 1.6vw, 22px);
+  font-weight: 850;
+  line-height: 1.15;
+  text-align: right;
+  text-transform: uppercase;
+  overflow-wrap: anywhere;
+}
+
 .segmented button:focus-visible {
   outline: 3px solid var(--cyan);
   outline-offset: 3px;
@@ -1569,7 +1581,10 @@ h1 {
 
 .hero-actions {
   grid-area: updated;
+  flex-direction: column;
+  align-items: flex-end;
   justify-content: end;
+  gap: 5px;
   margin-top: 0;
 }
 
@@ -1695,8 +1710,12 @@ h1 {
   }
 
   .hero-actions {
-    align-items: center;
+    align-items: start;
     justify-content: start;
+  }
+
+  .hero-tagline {
+    text-align: left;
   }
 
   .hero-receipts {
