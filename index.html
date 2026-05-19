@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AI Token Command Center</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">AI Usage // Personal Telemetry</p>
+          <h1><span id="heroTotal">--</span> tokens</h1>
+          <div class="hero-actions">
+            <span class="hero-updated">Updated <strong id="generatedAt">--</strong></span>
+          </div>
+        </div>
+      </header>
+
+      <section class="workspace">
+        <div class="chart-panel">
+          <div class="panel-head">
+            <div>
+              <h2>Daily Token Load</h2>
+              <p id="rangeCaption">--</p>
+            </div>
+            <div class="controls" aria-label="Range">
+              <div class="segmented" role="group" aria-label="Range">
+                <button type="button" class="active" data-range="all">All</button>
+                <button type="button" data-range="45">45d</button>
+                <button type="button" data-range="30">30d</button>
+                <button type="button" data-range="14">14d</button>
+              </div>
+            </div>
+          </div>
+          <div class="legend" id="modelLegend" aria-label="Model colors"></div>
+          <div class="chart-wrap">
+            <canvas id="dailyChart" width="1280" height="520" aria-label="Daily token usage chart"></canvas>
+            <div class="tooltip" id="chartTooltip" hidden></div>
+          </div>
+        </div>
+
+        <aside class="side-rail" aria-label="Breakdown">
+          <section class="side-panel">
+            <h2>Tokens by Model</h2>
+            <div class="model-mix" id="modelMix"></div>
+          </section>
+        </aside>
+      </section>
+    </main>
+
+    <script src="./data/usage.js"></script>
+    <script src="./app.js"></script>
+  </body>
+</html>

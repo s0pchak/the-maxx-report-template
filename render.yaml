@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: ai-token-dashboard
+    runtime: static
+    branch: main
+    autoDeploy: true
+    buildCommand: test -f data/usage.json && test -f data/usage.js && echo "Serving prebuilt static dashboard bundle"
+    staticPublishPath: .
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    headers:
+      - path: /index.html
+        name: Cache-Control
+        value: no-cache
+      - path: /data/*
+        name: Cache-Control
+        value: no-cache
+      - path: /*
+        name: X-Content-Type-Options
+        value: nosniff
