@@ -62,6 +62,7 @@ class UsageEvent:
     timestamp: datetime
     model: str
     usage: dict[str, int]
+    subagent: bool = False
 
 
 def get_local_tz() -> ZoneInfo:
@@ -395,6 +396,7 @@ def import_claude_usage(projects_source: SourceDir) -> tuple[list[UsageEvent], d
     selected: dict[tuple[str, str], tuple[int, datetime, UsageEvent]] = {}
 
     for transcript_file in transcript_files:
+        is_subagent_file = "/subagents/" in str(transcript_file)
         try:
             handle = transcript_file.open("r", encoding="utf-8", errors="replace")
         except OSError:
@@ -433,7 +435,7 @@ def import_claude_usage(projects_source: SourceDir) -> tuple[list[UsageEvent], d
                 if total_tokens <= 0:
                     stats["zeroTokenEvents"] += 1
                     continue
-                event = UsageEvent("claude", event_ts, model, usage_delta)
+                event = UsageEvent("claude", event_ts, model, usage_delta, subagent=is_subagent_file)
                 dedupe_key = (str(transcript_file), str(message_id))
                 current = selected.get(dedupe_key)
                 stats["candidateUsageEvents"] += 1
@@ -578,9 +580,11 @@ def build_usage() -> dict:
 
     by_day: dict[str, dict[str, int]] = {}
     model_totals: dict[str, dict[str, int]] = {}
+    hours_of_day = [empty_day() for _ in range(24)]
 
     for event in all_events:
-        day_key = event.timestamp.astimezone(local_tz).date().isoformat()
+        local_ts = event.timestamp.astimezone(local_tz)
+        day_key = local_ts.date().isoformat()
         day = by_day.setdefault(
             day_key,
             {
@@ -589,9 +593,12 @@ def build_usage() -> dict:
                 "lastTokenAt": None,
                 "sessionDurationSeconds": 0,
                 "models": {},
+                "subagentUsage": empty_day(),
             },
         )
         add_usage(day, event.usage)
+        if event.subagent:
+            add_usage(day["subagentUsage"], event.usage)
         day["firstTokenAt"] = (
             min(day["firstTokenAt"], event.timestamp.isoformat()) if day["firstTokenAt"] else event.timestamp.isoformat()
         )
@@ -604,6 +611,7 @@ def build_usage() -> dict:
         model_total = model_totals.setdefault(event.model, empty_day())
         set_model_provider(model_total, event.provider)
         add_usage(model_total, event.usage)
+        add_usage(hours_of_day[local_ts.hour], event.usage)
 
     days = []
     for date_key, values in sorted(by_day.items()):
@@ -622,6 +630,10 @@ def build_usage() -> dict:
         clean_values["sessionDurationSeconds"] = duration
         clean_values["models"] = model_rows
         days.append({"date": date_key, **clean_values})
+
+    subagent_totals = empty_day()
+    for day in days:
+        add_usage(subagent_totals, day.get("subagentUsage", {}))
 
     totals = empty_day()
     for day in days:
@@ -706,6 +718,10 @@ def build_usage() -> dict:
         },
         "stats": stats,
         "totals": totals,
+        "subagentTotals": subagent_totals,
+        "hoursOfDay": [
+            {"hour": hour, **bucket} for hour, bucket in enumerate(hours_of_day)
+        ],
         "models": model_rows,
         "providers": providers,
         "days": days,

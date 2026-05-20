@@ -139,10 +139,18 @@ class RefreshTokenDataTest(unittest.TestCase):
             "methodology",
             "stats",
             "totals",
+            "subagentTotals",
+            "hoursOfDay",
             "models",
             "days",
         }
         self.assertTrue(expected_fields.issubset(usage.keys()))
+        self.assertEqual(len(usage["hoursOfDay"]), 24)
+        for bucket in usage["hoursOfDay"]:
+            self.assertIn("hour", bucket)
+            self.assertIn("totalTokens", bucket)
+        for day in usage["days"]:
+            self.assertIn("subagentUsage", day)
         self.assertEqual(usage["schemaVersion"], 2)
         self.assertEqual(usage["firstDate"], "2026-01-02")
         self.assertEqual(usage["lastDate"], "2026-01-03")
@@ -200,6 +208,30 @@ class RefreshTokenDataTest(unittest.TestCase):
             js_text = (output_dir / "usage.js").read_text(encoding="utf-8")
             self.assertTrue(js_text.startswith("window.AI_TOKEN_USAGE = "))
             self.assertIn("window.CODEX_TOKEN_USAGE = window.AI_TOKEN_USAGE;", js_text)
+
+    def test_subagent_path_routes_to_subagent_usage_and_fills_hour_bucket(self):
+        usage, root = self.build_usage(
+            "claude-with-subagent",
+            "empty-codex",
+            "claude/projects",
+        )
+
+        days_by_date = {day["date"]: day for day in usage["days"]}
+        day = days_by_date["2026-01-04"]
+        # Main: input=100, output=50. Subagent: input=200, output=80.
+        # totalTokens for the day is 100+50 + 200+80 = 430.
+        self.assertEqual(day["totalTokens"], 430)
+        # Only the subagent path counts toward subagentUsage.
+        self.assertEqual(day["subagentUsage"]["totalTokens"], 280)
+        self.assertEqual(day["subagentUsage"]["outputTokens"], 80)
+        self.assertEqual(usage["subagentTotals"]["totalTokens"], 280)
+
+        # Hour bucket: both events fall in the same UTC date but different hours
+        # (14:30 and 15:00 UTC). Test runs with DASHBOARD_TIMEZONE=UTC so we
+        # land in hour buckets 14 and 15.
+        self.assertEqual(usage["hoursOfDay"][14]["totalTokens"], 150)
+        self.assertEqual(usage["hoursOfDay"][15]["totalTokens"], 280)
+        self.assert_no_absolute_fixture_paths(usage, root)
 
     def test_opencode_db_aggregates_into_provider_row(self):
         import sqlite3
