@@ -14,6 +14,7 @@ const state = {
   range: "all",
   metric: "output",
   heatmapPeriod: "12mo",
+  showSessionLine: true,
   hoveredIndex: null,
   pointerX: 0,
   pointerY: 0,
@@ -189,8 +190,10 @@ const els = {
   tableCaption: document.querySelector("#tableCaption"),
   chart: document.querySelector("#dailyChart"),
   tooltip: document.querySelector("#chartTooltip"),
+  sessionToggle: document.querySelector("#sessionToggle"),
   dailyRows: document.querySelector("#dailyRows"),
   modelMix: document.querySelector("#modelMix"),
+  highlightGrid: document.querySelector("#highlightGrid"),
   captureMeta: document.querySelector("#captureMeta"),
   heroTotal: document.querySelector("#heroTotal"),
   heroTotalUnit: document.querySelector("#heroTotalUnit"),
@@ -327,6 +330,20 @@ function durationHoursLabel(seconds = 0) {
   const hours = Math.round(Number(seconds || 0) / 3600);
   if (hours < 1) return durationLabel(seconds);
   return `${hours} ${hours === 1 ? "hour" : "hours"}`;
+}
+
+function formatMoneyCompact(value = 0) {
+  const amount = Number(value || 0);
+  if (!Number.isFinite(amount) || amount <= 0) return "$0";
+  if (amount >= 1_000_000) return `$${(amount / 1_000_000).toFixed(amount >= 10_000_000 ? 0 : 1)}M`;
+  if (amount >= 1_000) return `$${(amount / 1_000).toFixed(amount >= 10_000 ? 0 : 1)}K`;
+  return `$${Math.round(amount)}`;
+}
+
+// Street value reuses the single pricing source (data/pricing.js via
+// costForModelRow), so the highlight and the $ Cost metric mode always agree.
+function estimateStreetValue(models = usage.models || []) {
+  return models.reduce((sum, model) => sum + costForModelRow(model), 0);
 }
 
 function percentLabel(value = 0, total = 0) {
@@ -480,6 +497,82 @@ function buildMoments() {
 }
 
 let moments = buildMoments();
+
+function statHighlight(key) {
+  const highlights = usage.stats?.highlights;
+  if (!highlights) return null;
+  if (Array.isArray(highlights)) {
+    return highlights.find((item) => item.key === key || item.id === key) || null;
+  }
+  return highlights[key] || null;
+}
+
+function mergeHighlight(key, fallback) {
+  const item = statHighlight(key);
+  if (!item) return fallback;
+  return {
+    ...fallback,
+    ...item,
+    label: item.label || fallback.label,
+    value: item.value || fallback.value,
+    detail: item.detail || fallback.detail,
+  };
+}
+
+function buildHighlightItems() {
+  const peak = moments.peakDay;
+  const longest = moments.longestDay;
+  return [
+    mergeHighlight("streetValue", {
+      label: "Street Value",
+      value: formatMoneyCompact(estimateStreetValue()),
+      detail: "API-grade tokens, rack-rate contraband.",
+    }),
+    mergeHighlight("peakConcurrentTerminals", {
+      label: "Terminal Swarm",
+      value: "--",
+      detail: "Peak Codex terminals running in one hour.",
+    }),
+    mergeHighlight("peakDay", {
+      label: "Peak Day",
+      value: peak ? compactNumber(peak.totalTokens) : "--",
+      detail: peak ? `${formatDateLong(peak.date)} burned the most tokens.` : "Most tokens in one day.",
+    }),
+    mergeHighlight("longestSession", {
+      label: "Longest Session",
+      value: longest ? durationHoursLabel(longest.sessionDurationSeconds) : "--",
+      detail: longest ? `${formatDateLong(longest.date)} went end-to-end.` : "First token to last token in a day.",
+    }),
+    mergeHighlight("longestTaskTurn", {
+      label: "Longest Task Turn",
+      value: "--",
+      detail: "Longest single agent run with a start and finish.",
+    }),
+    mergeHighlight("toolCallPileup", {
+      label: "Tool Pileup",
+      value: moments.callsDay ? fullNumber(moments.callsDay.modelCalls) : "--",
+      detail: "Most tool calls packed into one session.",
+    }),
+  ];
+}
+
+function updateHighlights() {
+  if (!els.highlightGrid) return;
+  setHtml(
+    els.highlightGrid,
+    buildHighlightItems()
+      .map(
+        (item) => `
+          <article class="highlight-card">
+            <span>${escapeHtml(item.label)}</span>
+            <strong>${escapeHtml(item.value)}</strong>
+            <p>${escapeHtml(item.detail)}</p>
+          </article>
+        `,
+      )
+      .join(""),
+  );
+}
 
 function shortDateList(days, limit = 3) {
   if (!days.length) return "none";
@@ -785,11 +878,20 @@ function updateModelMix(days) {
   const total = state.metric === "cost"
     ? modelRows.reduce((acc, m) => acc + metricValue(m), 0)
     : metricValue(sumDays(days));
+  const availableHeight = Number(els.modelMix?.clientHeight || 0);
+  const rowBudget = availableHeight ? Math.max(Math.floor(availableHeight / 43), 1) : 8;
+  const visibleCount = Math.min(modelRows.length, rowBudget, 8);
+  const visibleRows = modelRows.slice(0, visibleCount);
+
+  if (els.modelMix) {
+    els.modelMix.classList.toggle("sparse", visibleRows.length > 0 && visibleRows.length <= 3);
+    els.modelMix.classList.toggle("single-model", visibleRows.length === 1);
+    els.modelMix.classList.toggle("fill-space", visibleRows.length > 3);
+  }
 
   setHtml(
     els.modelMix,
-    modelRows
-      .slice(0, 8)
+    visibleRows
       .map((model) => {
         const value = metricValue(model);
         const width = total ? Math.max((value / total) * 100, 1) : 0;
@@ -953,8 +1055,8 @@ function drawChart() {
 
   const compact = width < 620;
   const pad = compact
-    ? { top: 44, right: 48, bottom: 54, left: 54 }
-    : { top: 54, right: 82, bottom: 62, left: 76 };
+    ? { top: 44, right: state.showSessionLine ? 48 : 26, bottom: 54, left: 54 }
+    : { top: 54, right: state.showSessionLine ? 82 : 34, bottom: 62, left: 76 };
   const plotW = Math.max(width - pad.left - pad.right, 1);
   const plotH = Math.max(height - pad.top - pad.bottom, 1);
   const step = plotW / days.length;
@@ -1026,11 +1128,13 @@ function drawChart() {
     ctx.restore();
   });
 
-  ctx.textBaseline = "middle";
-  ctx.textAlign = "left";
-  ctx.fillStyle = "#93a29f";
-  ctx.fillText(durationLabel(durationMax), width - pad.right + 12, pad.top);
-  ctx.fillText("0m", width - pad.right + 12, pad.top + plotH);
+  if (state.showSessionLine) {
+    ctx.textBaseline = "middle";
+    ctx.textAlign = "left";
+    ctx.fillStyle = "#93a29f";
+    ctx.fillText(durationLabel(durationMax), width - pad.right + 12, pad.top);
+    ctx.fillText("0m", width - pad.right + 12, pad.top + plotH);
+  }
 
   days.forEach((day, index) => {
     const x = pad.left + index * step + (step - columnWidth) / 2;
@@ -1078,40 +1182,42 @@ function drawChart() {
     day,
   }));
 
-  ctx.save();
-  ctx.strokeStyle = "rgba(255, 191, 71, 0.22)";
-  ctx.lineWidth = compact ? 6 : 8;
-  ctx.shadowColor = "rgba(255, 191, 71, 0.42)";
-  ctx.shadowBlur = 18;
-  ctx.beginPath();
-  sessionPoints.forEach(({ x, y }, index) => {
-    if (index === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
-  });
-  ctx.stroke();
-  ctx.restore();
-
-  ctx.strokeStyle = "#ffd16a";
-  ctx.lineWidth = compact ? 2.4 : 3.2;
-  ctx.lineJoin = "round";
-  ctx.lineCap = "round";
-  ctx.beginPath();
-  sessionPoints.forEach(({ x, y }, index) => {
-    if (index === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
-  });
-  ctx.stroke();
-
-  sessionPoints.forEach(({ x, y, day }) => {
-    if (Number(day.sessionDurationSeconds || 0) < 20 * 60 * 60 && day !== days[hoverIndex]) return;
+  if (state.showSessionLine) {
+    ctx.save();
+    ctx.strokeStyle = "rgba(255, 191, 71, 0.22)";
+    ctx.lineWidth = compact ? 6 : 8;
+    ctx.shadowColor = "rgba(255, 191, 71, 0.42)";
+    ctx.shadowBlur = 18;
     ctx.beginPath();
-    ctx.fillStyle = "#ffd16a";
-    ctx.strokeStyle = "rgba(6, 7, 9, 0.85)";
-    ctx.lineWidth = 2;
-    ctx.arc(x, y, day === days[hoverIndex] ? 6 : 4.5, 0, Math.PI * 2);
-    ctx.fill();
+    sessionPoints.forEach(({ x, y }, index) => {
+      if (index === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
     ctx.stroke();
-  });
+    ctx.restore();
+
+    ctx.strokeStyle = "#ffd16a";
+    ctx.lineWidth = compact ? 2.4 : 3.2;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    sessionPoints.forEach(({ x, y }, index) => {
+      if (index === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+
+    sessionPoints.forEach(({ x, y, day }) => {
+      if (Number(day.sessionDurationSeconds || 0) < 20 * 60 * 60 && day !== days[hoverIndex]) return;
+      ctx.beginPath();
+      ctx.fillStyle = "#ffd16a";
+      ctx.strokeStyle = "rgba(6, 7, 9, 0.85)";
+      ctx.lineWidth = 2;
+      ctx.arc(x, y, day === days[hoverIndex] ? 6 : 4.5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+    });
+  }
 
   const recordBounds = {
     left: pad.left + 8,
@@ -1135,7 +1241,7 @@ function drawChart() {
   }
 
   const longestIndex = days.findIndex((day) => day.date === rangeLongestDay?.date);
-  if (!compact && longestIndex >= 0 && rangeLongestDay) {
+  if (state.showSessionLine && !compact && longestIndex >= 0 && rangeLongestDay) {
     const day = days[longestIndex];
     drawPillLabel(ctx, `Longest session: ${durationHoursLabel(day.sessionDurationSeconds)}`, recordBounds.right, recordBounds.top + 46, {
       align: "right",
@@ -1148,17 +1254,19 @@ function drawChart() {
 
   if (hoverIndex !== null && days[hoverIndex]) {
     const x = pad.left + hoverIndex * step + step / 2;
-    const y = chartY(days[hoverIndex].sessionDurationSeconds || 0, durationMax, pad, plotH);
     ctx.strokeStyle = "rgba(215, 255, 69, 0.62)";
     ctx.lineWidth = 1.4;
     ctx.beginPath();
     ctx.moveTo(x, pad.top);
     ctx.lineTo(x, pad.top + plotH);
     ctx.stroke();
-    ctx.fillStyle = "#fff3b0";
-    ctx.beginPath();
-    ctx.arc(x, y, 6, 0, Math.PI * 2);
-    ctx.fill();
+    if (state.showSessionLine) {
+      const y = chartY(days[hoverIndex].sessionDurationSeconds || 0, durationMax, pad, plotH);
+      ctx.fillStyle = "#fff3b0";
+      ctx.beginPath();
+      ctx.arc(x, y, 6, 0, Math.PI * 2);
+      ctx.fill();
+    }
   }
 
   ctx.fillStyle = "#8fa09c";
@@ -1515,6 +1623,7 @@ function render() {
   updatePersonalityLayer();
   updateSummary();
   updateModelMix(days);
+  updateHighlights();
   updateCapture(days);
   updateTable(days);
   updateHeatmap();
@@ -1564,6 +1673,15 @@ if (els.heatmapWrap) {
     if (!event.relatedTarget || !event.relatedTarget.closest?.(".heatmap-cell[data-date]")) {
       hideHeatmapTip();
     }
+  });
+}
+
+if (els.sessionToggle) {
+  els.sessionToggle.addEventListener("click", () => {
+    state.showSessionLine = !state.showSessionLine;
+    els.sessionToggle.classList.toggle("active", state.showSessionLine);
+    els.sessionToggle.setAttribute("aria-pressed", String(state.showSessionLine));
+    drawChart();
   });
 }
 
