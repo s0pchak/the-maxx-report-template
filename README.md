@@ -1,3 +1,5 @@
+<img width="229" height="51" alt="Screenshot 2026-05-20 at 1 19 13 PM" src="https://github.com/user-attachments/assets/372e1b17-9c30-4c0f-9df0-7d631d89e6a2" />
+
 # The Maxx Report
 
 Local telemetry for extremely normal AI usage.
@@ -11,12 +13,6 @@ The Maxx Report is a tiny command center for watching your AI coding assistants 
 It is not OpenAI billing truth. It is not Anthropic billing truth. It is a mirror held up to your choices.
 
 Run the importer, open `index.html`, and look at it locally. If you also want to deploy it to a cloud host so you can pull it up from your phone, there are configs for that too.
-
-## Original Build Receipt
-
-The token dashboard has already burned **212.5M tokens** figuring out how to tell us how many tokens we burned. This is either product development or a very ornate self-report.
-
-Counted on May 19, 2026 at roughly 7:06 PM ET from local Codex transcripts that mention this dashboard (`codex-token-dashboard`, `The Maxx Report`, `the-maxx-report`, or `maxxreport`): **20** transcript files, **1,619** recorded model calls, non-duplicate `last_token_usage.total_tokens` deltas summed. It is an aggregate build receipt, not billing truth, and it does not publish prompts, session IDs, local paths, or tool output.
 
 ## What It Shows
 
