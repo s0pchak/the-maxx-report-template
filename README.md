@@ -1,4 +1,4 @@
-<img width="229" height="51" alt="Screenshot 2026-05-20 at 1 19 13 PM" src="https://github.com/user-attachments/assets/372e1b17-9c30-4c0f-9df0-7d631d89e6a2" />
+<img width="661" height="160" alt="Screenshot 2026-05-20 at 1 20 52 PM" src="https://github.com/user-attachments/assets/5aec39ee-f250-463b-ac07-307cbb358d99" />
 
 # The Maxx Report
 
