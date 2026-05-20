@@ -1,0 +1,18 @@
+[build]
+  publish = "."
+  command = "test -f data/usage.sample.js && echo 'Serving prebuilt static dashboard bundle (real data/usage.js overrides the sample when committed)'"
+
+[[headers]]
+  for = "/index.html"
+  [headers.values]
+    Cache-Control = "no-cache"
+
+[[headers]]
+  for = "/data/*"
+  [headers.values]
+    Cache-Control = "no-cache"
+
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Content-Type-Options = "nosniff"

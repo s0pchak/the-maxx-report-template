@@ -12,12 +12,150 @@ const usage = window.AI_TOKEN_USAGE || window.CODEX_TOKEN_USAGE || {
 
 const state = {
   range: "all",
+  metric: "output",
+  heatmapPeriod: "12mo",
   showSessionLine: true,
+  isolatedModel: null,
   hoveredIndex: null,
   pointerX: 0,
   pointerY: 0,
   chartGeometry: null,
 };
+
+const METRIC_LABEL = {
+  output: "output tokens",
+  new: "new tokens (excl. cache reads)",
+  total: "total tokens (incl. cache reads)",
+  cost: "estimated USD",
+};
+
+const METRIC_SHORT = {
+  output: "output",
+  new: "new",
+  total: "total",
+  cost: "cost",
+};
+
+// Short, fixed-width-ish labels for the hero so switching metrics does not
+// reflow the headline. The verbose labels (METRIC_LABEL) still appear in the
+// caption and tooltips.
+const METRIC_UNIT = {
+  output: "output tokens",
+  new: "new tokens",
+  total: "total tokens",
+  cost: "spend (est.)",
+};
+
+const PRICING = window.AI_PRICING || { default: { input: 0, cacheRead: 0, output: 0 }, models: {} };
+const PLAN = window.AI_PLAN || { usdPerMonth: 0, label: "" };
+
+function planCostForRange(days) {
+  const perMonth = Number(PLAN.usdPerMonth || 0);
+  if (!perMonth || !days?.length) return 0;
+  return (perMonth / 30) * days.length;
+}
+
+function formatMultiplier(value) {
+  if (!Number.isFinite(value)) return "--";
+  if (value >= 100) return `${Math.round(value)}x`;
+  if (value >= 10) return `${value.toFixed(0)}x`;
+  return `${value.toFixed(1)}x`;
+}
+const pricingCache = new Map();
+
+function lookupPricing(modelName) {
+  if (!modelName) return PRICING.default;
+  if (pricingCache.has(modelName)) return pricingCache.get(modelName);
+  const models = PRICING.models || {};
+  const lower = String(modelName).toLowerCase();
+  let hit = models[modelName] || models[lower];
+  if (!hit) {
+    let bestKey = null;
+    for (const key of Object.keys(models)) {
+      const keyLower = key.toLowerCase();
+      if (lower.startsWith(keyLower) && (!bestKey || keyLower.length > bestKey.length)) {
+        bestKey = keyLower;
+        hit = models[key];
+      }
+    }
+  }
+  const resolved = hit || PRICING.default;
+  pricingCache.set(modelName, resolved);
+  return resolved;
+}
+
+function costForUsage(usage = {}, pricing = PRICING.default) {
+  const inputRate = Number(pricing.input || 0);
+  const cacheReadRate = Number(pricing.cacheRead || 0);
+  const cacheWriteRate = pricing.cacheWrite != null
+    ? Number(pricing.cacheWrite)
+    : inputRate * 1.25;
+  const outputRate = Number(pricing.output || 0);
+  const fresh = Number(usage.freshInputTokens || 0);
+  const cacheCreation = Number(usage.cacheCreationTokens || 0);
+  const rawInput = Math.max(fresh - cacheCreation, 0);
+  const cacheRead = Number(usage.cachedInputTokens || 0);
+  const output = Number(usage.outputTokens || 0) + Number(usage.reasoningOutputTokens || 0);
+  return (
+    rawInput * inputRate
+    + cacheCreation * cacheWriteRate
+    + cacheRead * cacheReadRate
+    + output * outputRate
+  ) / 1_000_000;
+}
+
+function costForModelRow(row = {}) {
+  return costForUsage(row, lookupPricing(row.name));
+}
+
+function costForDay(day = {}) {
+  const models = day.models || [];
+  if (models.length) {
+    return models.reduce((acc, model) => acc + costForModelRow(model), 0);
+  }
+  return costForUsage(day, PRICING.default);
+}
+
+function costForTotals(totals, days) {
+  if (Array.isArray(days)) {
+    return days.reduce((acc, day) => acc + costForDay(day), 0);
+  }
+  return costForUsage(totals, PRICING.default);
+}
+
+function metricValue(thing = {}, metric = state.metric) {
+  if (metric === "cost") {
+    if (Array.isArray(thing?.models) && thing.models.length) return costForDay(thing);
+    if (thing && typeof thing.name === "string") return costForModelRow(thing);
+    return costForUsage(thing, PRICING.default);
+  }
+  if (metric === "output") {
+    return Number(thing.outputTokens || 0) + Number(thing.reasoningOutputTokens || 0);
+  }
+  if (metric === "new") {
+    return (
+      Number(thing.freshInputTokens || 0)
+      + Number(thing.outputTokens || 0)
+      + Number(thing.reasoningOutputTokens || 0)
+    );
+  }
+  return Number(thing.totalTokens || 0);
+}
+
+const usdFull = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" });
+const usdCompact = new Intl.NumberFormat("en-US", {
+  style: "currency",
+  currency: "USD",
+  notation: "compact",
+  maximumFractionDigits: 2,
+});
+
+function formatMetric(value, mode = "compact") {
+  if (state.metric === "cost") {
+    return mode === "full" ? usdFull.format(value) : usdCompact.format(value);
+  }
+  return mode === "full" ? fullNumber(value) : compactNumber(value);
+}
 
 const modelPalette = [
   "#5ff0b2",
@@ -59,7 +197,25 @@ const els = {
   highlightGrid: document.querySelector("#highlightGrid"),
   captureMeta: document.querySelector("#captureMeta"),
   heroTotal: document.querySelector("#heroTotal"),
+  heroTotalUnit: document.querySelector("#heroTotalUnit"),
   heroCaption: document.querySelector("#heroCaption"),
+  planPill: document.querySelector("#planPill"),
+  heatmapWrap: document.querySelector("#heatmapWrap"),
+  heatmapMonths: document.querySelector("#heatmapMonths"),
+  heatmapCaption: document.querySelector("#heatmapCaption"),
+  heatmapLegend: document.querySelector("#heatmapLegend"),
+  heatmapPeriod: document.querySelector("#heatmapPeriod"),
+  heatmapTip: document.querySelector("#heatmapTip"),
+  heatmapPanel: document.querySelector(".pattern-heatmap"),
+  hoursWrap: document.querySelector("#hoursWrap"),
+  hoursCaption: document.querySelector("#hoursCaption"),
+  subagentWrap: document.querySelector("#subagentWrap"),
+  subagentCaption: document.querySelector("#subagentCaption"),
+  historyScroll: document.querySelector("#historyScroll"),
+  historyCaption: document.querySelector("#historyCaption"),
+  historyLegend: document.querySelector("#historyLegend"),
+  historyTip: document.querySelector("#historyTip"),
+  historyPanel: document.querySelector(".pattern-history"),
   heroPeakTokens: document.querySelector("#heroPeakTokens"),
   heroPeakDate: document.querySelector("#heroPeakDate"),
   heroLongestDuration: document.querySelector("#heroLongestDuration"),
@@ -96,6 +252,36 @@ function colorForModel(name) {
   }
   const color = modelPalette[hash % modelPalette.length];
   modelColors.set(name, color);
+  return color;
+}
+
+const projectPalette = [
+  "#62d8ff",
+  "#f6bf63",
+  "#ed6a8f",
+  "#a78bfa",
+  "#5ff0b2",
+  "#ff8f5f",
+  "#75a7ff",
+  "#d6f35a",
+  "#58d6c9",
+  "#c991ff",
+];
+const projectColors = new Map();
+let projectColorIndex = 0;
+
+// Sequential assignment (not hashing) so distinct projects get distinct colors.
+// Seed in token order first so the heaviest projects claim the clearest hues.
+function colorForProject(name) {
+  const key = name || "unknown";
+  if (projectColors.has(key)) return projectColors.get(key);
+  if (!name) {
+    projectColors.set(key, "#7f8f8b");
+    return "#7f8f8b";
+  }
+  const color = projectPalette[projectColorIndex % projectPalette.length];
+  projectColorIndex += 1;
+  projectColors.set(key, color);
   return color;
 }
 
@@ -190,29 +376,10 @@ function formatMoneyCompact(value = 0) {
   return `$${Math.round(amount)}`;
 }
 
-function rateForModel(model = {}) {
-  const name = String(model.name || "").toLowerCase();
-  const provider = providerLabel(model).toLowerCase();
-  if (provider.includes("claude") || name.includes("claude")) {
-    if (name.includes("opus")) return { input: 5, cached: 0.5, output: 25 };
-    if (name.includes("haiku")) return { input: 1, cached: 0.1, output: 5 };
-    return { input: 3, cached: 0.3, output: 15 };
-  }
-  if (name.includes("5.5")) return { input: 5, cached: 0.5, output: 30 };
-  if (name.includes("5.4-mini")) return { input: 0.75, cached: 0.075, output: 4.5 };
-  if (name.includes("5.4")) return { input: 2.5, cached: 0.25, output: 15 };
-  if (name.includes("mini")) return { input: 1.5, cached: 0.375, output: 6 };
-  return { input: 1.75, cached: 0.175, output: 14 };
-}
-
+// Street value reuses the single pricing source (data/pricing.js via
+// costForModelRow), so the highlight and the $ Cost metric mode always agree.
 function estimateStreetValue(models = usage.models || []) {
-  return models.reduce((sum, model) => {
-    const rate = rateForModel(model);
-    const fresh = Number(model.freshInputTokens || 0);
-    const cached = Number(model.cachedInputTokens || 0);
-    const output = Number(model.outputTokens || 0);
-    return sum + (fresh * rate.input + cached * rate.cached + output * rate.output) / 1_000_000;
-  }, 0);
+  return models.reduce((sum, model) => sum + costForModelRow(model), 0);
 }
 
 function percentLabel(value = 0, total = 0) {
@@ -305,17 +472,22 @@ function sumModels(days) {
   });
   return [...byModel.entries()]
     .map(([name, totals]) => ({ name, ...totals }))
-    .sort((a, b) => b.totalTokens - a.totalTokens);
+    .sort((a, b) => metricValue(b) - metricValue(a));
 }
 
 function topModelForDay(day) {
-  return visibleModels(day.models || [])[0] || { name: "unattributed", totalTokens: 0 };
+  const models = visibleModels(day.models || []);
+  if (!models.length) return { name: "unattributed", totalTokens: 0 };
+  return [...models].sort((a, b) => metricValue(b) - metricValue(a))[0];
 }
 
 function maxDayBy(days, key) {
+  const getValue = key === "totalTokens"
+    ? (day) => metricValue(day)
+    : (day) => Number(day?.[key] || 0);
   return days.reduce((best, day) => {
-    const value = Number(day?.[key] || 0);
-    const bestValue = Number(best?.[key] || 0);
+    const value = getValue(day);
+    const bestValue = best ? getValue(best) : -Infinity;
     if (!best || value > bestValue) return day;
     if (value === bestValue && String(day?.date || "") > String(best?.date || "")) return day;
     return best;
@@ -329,7 +501,7 @@ function pluralWord(value, singular, plural = `${singular}s`) {
 function buildMoments() {
   const days = usage.days || [];
   const models = [...(usage.models || [])].sort(
-    (a, b) => Number(b.totalTokens || 0) - Number(a.totalTokens || 0),
+    (a, b) => metricValue(b) - metricValue(a),
   );
   const unknownModel = models.find((model) => model.name === "unknown");
   const unknownModelCalls = Number(
@@ -337,86 +509,103 @@ function buildMoments() {
   );
   const leader = models[0] || null;
   const runnerUp = models[1] || null;
-  const gapTokens = leader && runnerUp
-    ? Number(leader.totalTokens || 0) - Number(runnerUp.totalTokens || 0)
-    : 0;
+  const leaderValue = leader ? metricValue(leader) : 0;
+  const runnerUpValue = runnerUp ? metricValue(runnerUp) : 0;
+  const gapTokens = leader && runnerUp ? leaderValue - runnerUpValue : 0;
 
   return {
     days,
-    totalTokens: Number(usage.totals?.totalTokens || 0),
+    totalTokens: metricValue(usage.totals || {}),
     totalCalls: Number(usage.totals?.modelCalls || 0),
     peakDay: maxDayBy(days, "totalTokens"),
     longestDay: maxDayBy(days, "sessionDurationSeconds"),
     callsDay: maxDayBy(days, "modelCalls"),
-    billionDays: days.filter((day) => Number(day.totalTokens || 0) >= billionTokens),
-    halfBillionDays: days.filter((day) => Number(day.totalTokens || 0) >= halfBillionTokens),
+    billionDays: days.filter((day) => metricValue(day) >= billionTokens),
+    halfBillionDays: days.filter((day) => metricValue(day) >= halfBillionTokens),
     unknownModelCalls,
     modelRace: {
       leader,
       runnerUp,
       gapTokens,
-      gapShare: runnerUp?.totalTokens ? gapTokens / Number(runnerUp.totalTokens) : 0,
+      gapShare: runnerUpValue ? gapTokens / runnerUpValue : 0,
     },
   };
 }
 
-const moments = buildMoments();
+let moments = buildMoments();
 
-function statHighlight(key) {
-  const highlights = usage.stats?.highlights;
-  if (!highlights) return null;
-  if (Array.isArray(highlights)) {
-    return highlights.find((item) => item.key === key || item.id === key) || null;
-  }
-  return highlights[key] || null;
-}
-
-function mergeHighlight(key, fallback) {
-  const item = statHighlight(key);
-  if (!item) return fallback;
-  return {
-    ...fallback,
-    ...item,
-    label: item.label || fallback.label,
-    value: item.value || fallback.value,
-    detail: item.detail || fallback.detail,
-  };
+// Highlights are computed from the selected date range (getRangeDays), the same
+// per-day fields the importer attaches, so they track the chart's range selector
+// instead of always showing all-time records.
+function maxDayByField(days, field) {
+  return days.reduce((best, day) => {
+    const value = Number(day?.[field] || 0);
+    if (value <= 0) return best;
+    if (!best || value > Number(best[field] || 0)) return day;
+    return best;
+  }, null);
 }
 
 function buildHighlightItems() {
-  const peak = moments.peakDay;
-  const longest = moments.longestDay;
+  const days = getRangeDays();
+  const first = days[0]?.date;
+  const last = days[days.length - 1]?.date;
+
+  const street = estimateStreetValue(sumModels(days));
+  const peak = maxDayByField(days, "totalTokens");
+
+  const rangeSessions = (usage.sessions?.list || []).filter(
+    (s) => first && last && s.startDate >= first && s.startDate <= last,
+  );
+  const longestSession = rangeSessions.reduce(
+    (best, s) => (!best || Number(s.durationSeconds || 0) > Number(best.durationSeconds || 0) ? s : best),
+    null,
+  );
+  const longestSessionSeconds = longestSession ? Number(longestSession.durationSeconds || 0) : 0;
+
+  const concDay = maxDayByField(days, "peakConcurrentTerminals");
+  const taskDay = maxDayByField(days, "longestTaskTurnSeconds");
+  const toolDay = maxDayByField(days, "toolCallPileup");
+
   return [
-    mergeHighlight("streetValue", {
+    {
       label: "Street Value",
-      value: formatMoneyCompact(estimateStreetValue()),
+      value: formatMoneyCompact(street),
       detail: "API-grade tokens, rack-rate contraband.",
-    }),
-    mergeHighlight("peakConcurrentTerminals", {
+    },
+    {
       label: "Terminal Swarm",
-      value: "--",
-      detail: "Peak Codex terminals running in one hour.",
-    }),
-    mergeHighlight("peakDay", {
+      value: concDay ? fullNumber(concDay.peakConcurrentTerminals) : "N/A",
+      detail: concDay
+        ? `${formatDateLong(concDay.date)} ran the most Codex terminals at once.`
+        : "Peak Codex terminals running in one hour.",
+    },
+    {
       label: "Peak Day",
       value: peak ? compactNumber(peak.totalTokens) : "--",
       detail: peak ? `${formatDateLong(peak.date)} burned the most tokens.` : "Most tokens in one day.",
-    }),
-    mergeHighlight("longestSession", {
+    },
+    {
       label: "Longest Session",
-      value: longest ? durationHoursLabel(longest.sessionDurationSeconds) : "--",
-      detail: longest ? `${formatDateLong(longest.date)} went end-to-end.` : "First token to last token in a day.",
-    }),
-    mergeHighlight("longestTaskTurn", {
+      value: longestSessionSeconds > 0 ? durationHoursLabel(longestSessionSeconds) : "--",
+      detail: longestSession
+        ? `${formatDateLong(longestSession.startDate)} ran longest without a 2h+ break.`
+        : "Longest continuous session.",
+    },
+    {
       label: "Longest Task Turn",
-      value: "--",
-      detail: "Longest single agent run with a start and finish.",
-    }),
-    mergeHighlight("toolCallPileup", {
+      value: taskDay ? durationLabel(taskDay.longestTaskTurnSeconds) : "N/A",
+      detail: taskDay
+        ? `${formatDateLong(taskDay.date)} had one agent on the clock.`
+        : "Longest single agent run with a start and finish.",
+    },
+    {
       label: "Tool Pileup",
-      value: moments.callsDay ? fullNumber(moments.callsDay.modelCalls) : "--",
-      detail: "Most tool calls packed into one session.",
-    }),
+      value: toolDay ? fullNumber(toolDay.toolCallPileup) : "N/A",
+      detail: toolDay
+        ? `${formatDateLong(toolDay.date)} packed the most tool calls into one session.`
+        : "Most tool calls packed into one session.",
+    },
   ];
 }
 
@@ -457,16 +646,24 @@ function modelRaceLine(race = moments.modelRace) {
 function headlineLine() {
   const peak = moments.peakDay;
   if (!peak) return "No token events yet. Suspense is cheap.";
-  return `${compactNumber(moments.totalTokens)} tokens across ${fullNumber(moments.days.length)} logged days.`;
+  return `${formatMetric(moments.totalTokens)} ${METRIC_LABEL[state.metric]} across ${fullNumber(moments.days.length)} logged days.`;
 }
 
 function incidentTone(day) {
   if (!day) return "No incident selected.";
-  if (Number(day.totalTokens || 0) >= billionTokens) {
-    return "This day cleared 1B tokens. The y-axis needed a meeting.";
+  if (state.metric === "cost") {
+    const usd = metricValue(day);
+    if (usd >= 1000) return `This day cleared four figures of model spend. The CFO ticked.`;
+    if (usd >= 250) return `This day spent more on tokens than on lunch.`;
+    if (usd >= 50) return `A solid weekday at the model meter.`;
+    return `A quiet day at the meter.`;
   }
-  if (Number(day.totalTokens || 0) >= halfBillionTokens) {
-    return "This day cleared 500M tokens and still tried to look casual.";
+  const value = metricValue(day);
+  if (value >= billionTokens) {
+    return `This day cleared 1B ${METRIC_SHORT[state.metric]} tokens. The y-axis needed a meeting.`;
+  }
+  if (value >= halfBillionTokens) {
+    return `This day cleared 500M ${METRIC_SHORT[state.metric]} tokens and still tried to look casual.`;
   }
   if (Number(day.sessionDurationSeconds || 0) >= 20 * 60 * 60) {
     return "The session length nearly ate the whole calendar square.";
@@ -486,6 +683,12 @@ function updateSelectedIncident(day = moments.peakDay, source = "Peak Day") {
 
   const top = topModelForDay(day);
   const cachedShare = percentLabel(day.cachedInputTokens, day.inputTokens);
+  const dayValue = metricValue(day);
+  const topValue = metricValue(top);
+  const tokenLabel = state.metric === "cost"
+    ? "Spend"
+    : (METRIC_SHORT[state.metric] === "total" ? "Tokens" : `${METRIC_SHORT[state.metric].replace(/^./, (c) => c.toUpperCase())} tokens`);
+  const topLabel = state.metric === "cost" ? "Top Spend" : `Top ${tokenLabel}`;
   setHtml(
     els.selectedIncident,
     `
@@ -494,11 +697,11 @@ function updateSelectedIncident(day = moments.peakDay, source = "Peak Day") {
         <strong>${formatDateLong(day.date)}</strong>
         <p>${escapeHtml(incidentTone(day))}</p>
         <dl class="incident-stats">
-          <div><dt>Tokens</dt><dd>${fullNumber(day.totalTokens)}</dd></div>
+          <div><dt>${tokenLabel}</dt><dd>${formatMetric(dayValue, "full")}</dd></div>
           <div><dt>Session</dt><dd>${durationLabel(day.sessionDurationSeconds)}</dd></div>
           <div><dt>Calls</dt><dd>${fullNumber(day.modelCalls)}</dd></div>
           <div><dt>Top Model</dt><dd>${escapeHtml(top.name)}</dd></div>
-          <div><dt>Top Tokens</dt><dd>${compactNumber(top.totalTokens)}</dd></div>
+          <div><dt>${topLabel}</dt><dd>${formatMetric(topValue)}</dd></div>
           <div><dt>Cached Input</dt><dd>${cachedShare}</dd></div>
         </dl>
       </article>
@@ -513,8 +716,8 @@ function tickerItems() {
   return [
     peak && {
       label: "Peak day",
-      value: compactNumber(peak.totalTokens),
-      detail: `${formatDate(peak.date)} carried ${fullNumber(peak.totalTokens)} tokens.`,
+      value: formatMetric(metricValue(peak)),
+      detail: `${formatDate(peak.date)} carried ${formatMetric(metricValue(peak), "full")} ${METRIC_LABEL[state.metric]}.`,
     },
     longest && {
       label: "Longest session",
@@ -579,13 +782,19 @@ function achievementItems() {
 
   return [
     {
-      title: "Total Stack",
-      value: compactNumber(moments.totalTokens),
-      detail: "The receipt has reached budget-review length.",
+      title: state.metric === "output"
+        ? "Output Stack"
+        : state.metric === "new"
+          ? "New-Tokens Stack"
+          : state.metric === "cost"
+            ? "Approx. Spend"
+            : "Total Stack",
+      value: formatMetric(moments.totalTokens),
+      detail: `The receipt is measured in ${METRIC_LABEL[state.metric]}.`,
     },
     peak && {
       title: "Peak Day",
-      value: compactNumber(peak.totalTokens),
+      value: formatMetric(metricValue(peak)),
       detail: `${formatDateLong(peak.date)} put the chart on notice.`,
     },
     longest && {
@@ -648,10 +857,26 @@ function updateHeroReceipts() {
   const peak = moments.peakDay;
   const longest = moments.longestDay;
   const calls = moments.callsDay;
+  const rangeDays = getRangeDays();
 
-  setText(els.heroTotal, compactNumber(moments.totalTokens));
+  setText(els.heroTotal, formatMetric(moments.totalTokens));
+  setText(els.heroTotalUnit, METRIC_UNIT[state.metric]);
+
+  if (els.planPill) {
+    const perMonth = Number(PLAN.usdPerMonth || 0);
+    if (state.metric === "cost" && perMonth > 0 && rangeDays.length > 0) {
+      const rangeCost = rangeDays.reduce((acc, day) => acc + metricValue(day, "cost"), 0);
+      const planCost = planCostForRange(rangeDays);
+      const ratio = planCost > 0 ? rangeCost / planCost : 0;
+      const planLabel = PLAN.label || "plan";
+      els.planPill.textContent = `${formatMultiplier(ratio)} your ${usdFull.format(perMonth)}/mo ${planLabel}`;
+      els.planPill.hidden = false;
+    } else {
+      els.planPill.hidden = true;
+    }
+  }
   setText(els.heroCaption, headlineLine());
-  setText(els.heroPeakTokens, peak ? compactNumber(peak.totalTokens) : "--");
+  setText(els.heroPeakTokens, peak ? formatMetric(metricValue(peak)) : "--");
   setText(els.heroPeakDate, peak ? formatDateLong(peak.date) : "--");
   setText(
     els.heroLongestDuration,
@@ -675,8 +900,11 @@ function updatePersonalityLayer() {
 function updateSummary() {
   const days = usage.days || [];
   const latest = days.at(-1);
-  const topModel = (usage.models || [])[0];
-  const totalTokens = Number(usage.totals?.totalTokens || 0);
+  const sortedModels = [...(usage.models || [])].sort(
+    (a, b) => metricValue(b) - metricValue(a),
+  );
+  const topModel = sortedModels[0];
+  const totalTokens = metricValue(usage.totals || {});
 
   setText(els.generatedDate, formatGeneratedDate(usage.generatedAt));
   setText(els.generatedTime, formatGeneratedTime(usage.generatedAt));
@@ -685,22 +913,24 @@ function updateSummary() {
     setText(els.ownerHandle, ownerHandle);
     els.ownerHandle.hidden = !ownerHandle;
   }
-  setText(els.totalTokens, compactNumber(totalTokens));
+  setText(els.totalTokens, formatMetric(totalTokens));
   setText(els.dateSpan, `${formatDateLong(usage.firstDate)} to ${formatDateLong(usage.lastDate)}`);
-  setText(els.todayTokens, latest ? compactNumber(latest.totalTokens) : "--");
+  setText(els.todayTokens, latest ? formatMetric(metricValue(latest)) : "--");
   setText(els.todayCalls, latest ? `${fullNumber(latest.modelCalls)} calls` : "--");
   setText(els.durationValue, latest ? durationLabel(latest.sessionDurationSeconds) : "--");
   setText(els.durationDate, latest ? formatDateLong(latest.date) : "--");
   setText(els.topModel, topModel ? topModel.name : "--");
   setText(
     els.topModelShare,
-    topModel ? `${percentLabel(topModel.totalTokens, totalTokens)} of total` : "--",
+    topModel ? `${percentLabel(metricValue(topModel), totalTokens)} of ${METRIC_SHORT[state.metric]}` : "--",
   );
 }
 
 function updateModelMix(days) {
   const modelRows = sumModels(days);
-  const total = sumDays(days).totalTokens;
+  const total = state.metric === "cost"
+    ? modelRows.reduce((acc, m) => acc + metricValue(m), 0)
+    : metricValue(sumDays(days));
   const availableHeight = Number(els.modelMix?.clientHeight || 0);
   const rowBudget = availableHeight ? Math.max(Math.floor(availableHeight / 43), 1) : 8;
   const visibleCount = Math.min(modelRows.length, rowBudget, 8);
@@ -710,25 +940,29 @@ function updateModelMix(days) {
     els.modelMix.classList.toggle("sparse", visibleRows.length > 0 && visibleRows.length <= 3);
     els.modelMix.classList.toggle("single-model", visibleRows.length === 1);
     els.modelMix.classList.toggle("fill-space", visibleRows.length > 3);
+    els.modelMix.classList.toggle("has-isolation", Boolean(state.isolatedModel));
   }
 
   setHtml(
     els.modelMix,
     visibleRows
       .map((model) => {
-        const width = total ? Math.max((model.totalTokens / total) * 100, 1) : 0;
+        const value = metricValue(model);
+        const width = total ? Math.max((value / total) * 100, 1) : 0;
         const provider = providerLabel(model);
+        const isIsolated = state.isolatedModel === model.name;
+        const rowClass = `model-row${isIsolated ? " isolated" : ""}`;
         return `
-          <div class="model-row">
+          <div class="${rowClass}" data-model="${escapeHtml(model.name)}" role="button" tabindex="0" aria-pressed="${isIsolated}" title="Click to isolate ${escapeHtml(model.name)} in the chart">
             <div>
               <span title="${escapeHtml(modelTitle(model))}">
                 <i style="background:${colorForModel(model.name)}"></i>
                 <span class="model-label">${escapeHtml(model.name)}</span>
               </span>
-              <strong>${compactNumber(model.totalTokens)}</strong>
+              <strong>${formatMetric(value)}</strong>
             </div>
             <div class="track"><b style="width:${width}%; background:${colorForModel(model.name)}"></b></div>
-            <small>${provider ? `${escapeHtml(provider)} &middot; ` : ""}${percentLabel(model.totalTokens, total)} &middot; ${fullNumber(model.modelCalls)} calls</small>
+            <small>${provider ? `${escapeHtml(provider)} &middot; ` : ""}${percentLabel(value, total)} &middot; ${fullNumber(model.modelCalls)} calls</small>
           </div>
         `;
       })
@@ -883,11 +1117,17 @@ function drawChart() {
   const plotH = Math.max(height - pad.top - pad.bottom, 1);
   const step = plotW / days.length;
   const columnWidth = Math.max(Math.min(step * 0.62, compact ? 14 : 22), days.length > 80 ? 2 : 5);
-  const maxTokens = Math.max(...days.map((day) => day.totalTokens || 0), 1);
+  const isolated = state.isolatedModel;
+  const dayChartValue = (day) => {
+    if (!isolated) return metricValue(day);
+    const entry = (day.models || []).find((model) => model.name === isolated);
+    return entry ? metricValue(entry) : 0;
+  };
+  const maxTokens = Math.max(...days.map(dayChartValue), 1);
   const tokenMax = Math.max(maxTokens * 1.08, 1);
   const maxDuration = Math.max(...days.map((day) => day.sessionDurationSeconds || 0), 60 * 60);
   const durationMax = Math.max(maxDuration, 24 * 60 * 60);
-  const orderedModels = modelRows.map((model) => model.name);
+  const orderedModels = isolated ? [isolated] : modelRows.map((model) => model.name);
   const hoverIndex = state.hoveredIndex;
 
   state.chartGeometry = { pad, plotW, plotH, step, columnWidth };
@@ -932,7 +1172,7 @@ function drawChart() {
     ctx.moveTo(pad.left, y);
     ctx.lineTo(width - pad.right, y);
     ctx.stroke();
-    ctx.fillText(compactNumber(tokenValue), pad.left - 10, y);
+    ctx.fillText(formatMetric(tokenValue), pad.left - 10, y);
   }
 
   [halfBillionTokens, billionTokens].forEach((threshold) => {
@@ -970,7 +1210,8 @@ function drawChart() {
     ctx.restore();
 
     orderedModels.forEach((modelName) => {
-      const value = Number(modelMap.get(modelName)?.totalTokens || 0);
+      const modelEntry = modelMap.get(modelName);
+      const value = modelEntry ? metricValue(modelEntry) : 0;
       if (!value) return;
       const segmentHeight = Math.max((value / tokenMax) * plotH, 1.25);
       yBase -= segmentHeight;
@@ -1046,12 +1287,15 @@ function drawChart() {
     top: pad.top + 8,
     bottom: pad.top + plotH - 8,
   };
-  const rangePeakDay = maxDayBy(days, "totalTokens");
+  const rangePeakDay = isolated
+    ? days.reduce((best, day) => (!best || dayChartValue(day) > dayChartValue(best) ? day : best), null)
+    : maxDayBy(days, "totalTokens");
   const rangeLongestDay = maxDayBy(days, "sessionDurationSeconds");
   const peakIndex = days.findIndex((day) => day.date === rangePeakDay?.date);
-  if (!compact && peakIndex >= 0 && rangePeakDay) {
+  if (!compact && peakIndex >= 0 && rangePeakDay && dayChartValue(rangePeakDay) > 0) {
     const day = days[peakIndex];
-    drawPillLabel(ctx, `Most tokens: ${compactNumber(day.totalTokens)}`, recordBounds.right, recordBounds.top + 18, {
+    const label = state.metric === "cost" ? "Most spend" : `Most ${METRIC_SHORT[state.metric]}`;
+    drawPillLabel(ctx, `${label}: ${formatMetric(dayChartValue(day))}`, recordBounds.right, recordBounds.top + 18, {
       align: "right",
       color: "#d7ff45",
       background: "rgba(8, 10, 10, 0.88)",
@@ -1063,7 +1307,7 @@ function drawChart() {
   const longestIndex = days.findIndex((day) => day.date === rangeLongestDay?.date);
   if (state.showSessionLine && !compact && longestIndex >= 0 && rangeLongestDay) {
     const day = days[longestIndex];
-    drawPillLabel(ctx, `Longest session: ${durationHoursLabel(day.sessionDurationSeconds)}`, recordBounds.right, recordBounds.top + 46, {
+    drawPillLabel(ctx, `Most active day: ${durationHoursLabel(day.sessionDurationSeconds)}`, recordBounds.right, recordBounds.top + 46, {
       align: "right",
       color: "#ffbf47",
       background: "rgba(8, 10, 10, 0.88)",
@@ -1100,8 +1344,13 @@ function drawChart() {
     ctx.fillText(formatDate(days[index].date), x, height - 28);
   }
 
-  setText(els.rangeCaption, `${fullNumber(days.length)} days burning tokens`);
-  els.rangeCaption.title = "";
+  setText(
+    els.rangeCaption,
+    isolated
+      ? `${fullNumber(days.length)} days | isolated: ${isolated} (click it again to clear)`
+      : `${fullNumber(days.length)} days | bars = ${METRIC_LABEL[state.metric]}`,
+  );
+  els.rangeCaption.title = "Session length is the time between the first counted token event and the last counted token event in each local day.";
   updateTooltip(days);
 }
 
@@ -1114,32 +1363,47 @@ function updateTooltip(days) {
   const day = days[state.hoveredIndex];
   const chartRect = els.chart.getBoundingClientRect();
   const left = Math.min(Math.max(state.pointerX || chartRect.width / 2, 190), chartRect.width - 190);
-  const top = Math.min(Math.max(state.pointerY || 80, 130), chartRect.height - 28);
-  const rows = visibleModels(day.models || [])
+  const rows = [...visibleModels(day.models || [])]
+    .sort((a, b) => metricValue(b) - metricValue(a))
     .slice(0, 5)
     .map(
       (model) => `
         <span class="tip-row" title="${escapeHtml(modelTitle(model))}">
           <i style="background:${colorForModel(model.name)}"></i>
           <em>${escapeHtml(model.name)}</em>
-          <b>${compactNumber(model.totalTokens)}</b>
+          <b>${formatMetric(metricValue(model))}</b>
         </span>
       `,
     )
     .join("");
 
   els.tooltip.hidden = false;
-  els.tooltip.style.left = `${left}px`;
-  els.tooltip.style.top = `${top}px`;
   els.tooltip.innerHTML = `
     <span class="tip-date">${formatDateLong(day.date)}</span>
-    <strong class="tip-total">${fullNumber(day.totalTokens)} tokens</strong>
+    <strong class="tip-total">${formatMetric(metricValue(day), "full")} ${METRIC_LABEL[state.metric]}</strong>
     <div class="tip-metrics">
       <span><b>${durationLabel(day.sessionDurationSeconds)}</b><em>session length</em></span>
       <span><b>${fullNumber(day.modelCalls)}</b><em>calls</em></span>
     </div>
     <div class="tip-models">${rows}</div>
   `;
+
+  // Place above the pointer by default, but flip below when a tall peak leaves
+  // no room above (the chart clips overflow, which was cutting the tooltip off).
+  const margin = 14;
+  const pointerY = state.pointerY || 80;
+  const tipHeight = els.tooltip.offsetHeight;
+  const flipBelow = pointerY - tipHeight - margin < 0;
+  let top;
+  if (flipBelow) {
+    top = Math.min(pointerY, chartRect.height - tipHeight - margin);
+    els.tooltip.style.transform = `translate(-50%, ${margin}px)`;
+  } else {
+    top = pointerY;
+    els.tooltip.style.transform = `translate(-50%, calc(-100% - ${margin}px))`;
+  }
+  els.tooltip.style.left = `${left}px`;
+  els.tooltip.style.top = `${Math.max(top, 0)}px`;
 }
 
 function updateTable(days) {
@@ -1154,10 +1418,10 @@ function updateTable(days) {
         return `
           <tr data-date="${day.date}">
             <td>${formatDateLong(day.date)}</td>
-            <td>${fullNumber(day.totalTokens)}</td>
+            <td>${formatMetric(metricValue(day), "full")}</td>
             <td>${durationLabel(day.sessionDurationSeconds)}</td>
             <td><span class="table-model"><i style="background:${colorForModel(top.name)}"></i>${escapeHtml(top.name)}</span></td>
-            <td>${fullNumber(top.totalTokens)}</td>
+            <td>${formatMetric(metricValue(top), "full")}</td>
             <td>${fullNumber(day.modelCalls)}</td>
           </tr>
         `;
@@ -1166,15 +1430,418 @@ function updateTable(days) {
   );
 }
 
+function heatColor(intensity) {
+  if (intensity <= 0) return "rgba(245, 241, 232, 0.06)";
+  const stops = [
+    [0.12, [60, 80, 70]],
+    [0.28, [88, 214, 201]],
+    [0.55, [95, 240, 178]],
+    [0.80, [215, 255, 69]],
+    [1.00, [255, 191, 71]],
+  ];
+  for (let i = 0; i < stops.length; i += 1) {
+    if (intensity <= stops[i][0]) {
+      const prev = i === 0 ? [0, [40, 60, 55]] : stops[i - 1];
+      const next = stops[i];
+      const span = next[0] - prev[0] || 1;
+      const t = (intensity - prev[0]) / span;
+      const r = Math.round(prev[1][0] + (next[1][0] - prev[1][0]) * t);
+      const g = Math.round(prev[1][1] + (next[1][1] - prev[1][1]) * t);
+      const b = Math.round(prev[1][2] + (next[1][2] - prev[1][2]) * t);
+      return `rgb(${r}, ${g}, ${b})`;
+    }
+  }
+  return "rgb(255, 191, 71)";
+}
+
+const DOW_LONG = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+const MONTH_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+function isoLocal(date) {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+function heatmapYears() {
+  const years = new Set((usage.days || []).map((day) => String(day.date).slice(0, 4)));
+  return [...years].filter(Boolean).sort().reverse();
+}
+
+function heatmapWindow() {
+  const today = new Date();
+  today.setHours(12, 0, 0, 0);
+  if (state.heatmapPeriod === "12mo") {
+    const start = new Date(today);
+    start.setFullYear(start.getFullYear() - 1);
+    start.setDate(start.getDate() + 1);
+    return { start, end: today };
+  }
+  const year = Number(state.heatmapPeriod);
+  const start = new Date(year, 0, 1, 12, 0, 0, 0);
+  let end = new Date(year, 11, 31, 12, 0, 0, 0);
+  if (end > today) end = today; // current year cuts short at today
+  return { start, end };
+}
+
+function renderHeatmapControls() {
+  if (!els.heatmapPeriod) return;
+  const options = [{ key: "12mo", label: "12 mo" }, ...heatmapYears().map((y) => ({ key: y, label: y }))];
+  if (!options.some((opt) => opt.key === state.heatmapPeriod)) {
+    state.heatmapPeriod = options[0].key;
+  }
+  els.heatmapPeriod.innerHTML = options
+    .map(
+      (opt) =>
+        `<button type="button" class="${opt.key === state.heatmapPeriod ? "active" : ""}" data-heatmap-period="${opt.key}">${escapeHtml(opt.label)}</button>`,
+    )
+    .join("");
+}
+
+function updateHeatmap() {
+  if (!els.heatmapWrap) return;
+  const byDate = new Map((usage.days || []).map((day) => [day.date, day]));
+  const { start, end } = heatmapWindow();
+  // Align the grid so the first column starts on Sunday.
+  const gridStart = new Date(start);
+  gridStart.setDate(gridStart.getDate() - gridStart.getDay());
+
+  const windowValues = [];
+  for (const day of usage.days || []) {
+    const date = new Date(`${day.date}T12:00:00`);
+    if (date >= start && date <= end) windowValues.push(metricValue(day));
+  }
+  const maxValue = Math.max(...windowValues, 1);
+  const activeDays = windowValues.filter((value) => value > 0).length;
+
+  const cells = [];
+  const monthCols = [];
+  const cursor = new Date(gridStart);
+  let column = 0;
+  let lastMonthLabeled = -1;
+  while (cursor <= end) {
+    if (cursor.getDay() === 0) {
+      // Top of a new week column: label it if it introduces a new month.
+      const month = cursor.getMonth();
+      if (month !== lastMonthLabeled && cursor >= start) {
+        monthCols[column] = MONTH_ABBR[month];
+        lastMonthLabeled = month;
+      }
+      column += 1;
+    }
+    const iso = isoLocal(cursor);
+    const day = byDate.get(iso);
+    const value = day ? metricValue(day) : 0;
+    const inRange = cursor >= start && cursor <= end;
+    if (!inRange) {
+      cells.push(`<div class="heatmap-cell" data-empty="true"></div>`);
+    } else if (value <= 0) {
+      cells.push(`<div class="heatmap-cell" data-date="${iso}" data-value="0"></div>`);
+    } else {
+      const intensity = Math.min(value / maxValue, 1);
+      const color = heatColor(intensity);
+      cells.push(
+        `<div class="heatmap-cell" data-date="${iso}" data-active="true" style="background:${color};border-color:transparent"></div>`,
+      );
+    }
+    cursor.setDate(cursor.getDate() + 1);
+  }
+
+  els.heatmapWrap.innerHTML = cells.join("");
+
+  if (els.heatmapMonths) {
+    const totalCols = column;
+    const monthCells = [];
+    for (let i = 0; i < totalCols; i += 1) {
+      monthCells.push(
+        monthCols[i]
+          ? `<div class="heatmap-month"><span>${monthCols[i]}</span></div>`
+          : `<div class="heatmap-month"></div>`,
+      );
+    }
+    els.heatmapMonths.innerHTML = monthCells.join("");
+  }
+
+  const periodLabel = state.heatmapPeriod === "12mo" ? "trailing 12 months" : state.heatmapPeriod;
+  setText(
+    els.heatmapCaption,
+    `${fullNumber(activeDays)} active days in ${periodLabel} · color = ${METRIC_LABEL[state.metric]}`,
+  );
+  if (els.heatmapLegend) {
+    const ramp = [0.05, 0.25, 0.5, 0.75, 1].map((step) => `<i style="background:${heatColor(step)}"></i>`).join("");
+    els.heatmapLegend.innerHTML = `less ${ramp} more`;
+  }
+}
+
+function showHeatmapTip(cell) {
+  if (!els.heatmapTip || !els.heatmapPanel) return;
+  const iso = cell.dataset.date;
+  if (!iso) return;
+  const day = (usage.days || []).find((d) => d.date === iso);
+  const date = new Date(`${iso}T12:00:00`);
+  const value = day ? metricValue(day) : 0;
+  const calls = day ? Number(day.modelCalls || 0) : 0;
+  els.heatmapTip.innerHTML = `
+    <span class="tip-dow">${DOW_LONG[date.getDay()]}</span>
+    <span class="tip-date">${formatDateLong(iso)}</span>
+    <span class="tip-value">${value > 0 ? `${formatMetric(value, "full")} ${METRIC_LABEL[state.metric]}` : "no activity"}</span>
+    ${value > 0 ? `<span class="tip-sub">${fullNumber(calls)} calls</span>` : ""}
+  `;
+  const panelRect = els.heatmapPanel.getBoundingClientRect();
+  const cellRect = cell.getBoundingClientRect();
+  const left = cellRect.left - panelRect.left + cellRect.width / 2;
+  const top = cellRect.top - panelRect.top;
+  els.heatmapTip.style.left = `${left}px`;
+  els.heatmapTip.style.top = `${top}px`;
+  els.heatmapTip.hidden = false;
+  cell.classList.add("is-hovered");
+}
+
+function hideHeatmapTip() {
+  if (els.heatmapTip) els.heatmapTip.hidden = true;
+  els.heatmapWrap?.querySelectorAll(".heatmap-cell.is-hovered").forEach((c) => c.classList.remove("is-hovered"));
+}
+
+function updateHoursHistogram(days) {
+  if (!els.hoursWrap) return;
+  // Sum per-day hour buckets across the visible range so the histogram
+  // follows the chart's range selector. Falls back to the all-time
+  // hoursOfDay aggregate if per-day data isn't present (older bundles).
+  const values = Array(24).fill(0);
+  let havePerDay = false;
+  (days || []).forEach((day) => {
+    const hours = day.hours;
+    if (!hours) return;
+    havePerDay = true;
+    Object.entries(hours).forEach(([hour, usageRow]) => {
+      const idx = Number(hour);
+      if (idx >= 0 && idx < 24) values[idx] += metricValue(usageRow);
+    });
+  });
+  if (!havePerDay) {
+    const fallback = usage.hoursOfDay || [];
+    if (!fallback.length) {
+      els.hoursWrap.innerHTML = "";
+      setText(els.hoursCaption, "Hour data not in this build.");
+      return;
+    }
+    fallback.forEach((bucket) => {
+      const idx = Number(bucket.hour);
+      if (idx >= 0 && idx < 24) values[idx] = metricValue(bucket);
+    });
+  }
+  const buckets = values;
+  const max = Math.max(...values, 1);
+  const total = values.reduce((a, b) => a + b, 0);
+  const peakHour = values.indexOf(Math.max(...values));
+  const bars = buckets.map((bucket, hour) => {
+    const value = values[hour];
+    const heightPct = (value / max) * 100;
+    const label = value > 0
+      ? `${String(hour).padStart(2, "0")}:00 · ${formatMetric(value, "full")} ${METRIC_LABEL[state.metric]}`
+      : `${String(hour).padStart(2, "0")}:00 · quiet`;
+    const tick = hour % 6 === 0 ? String(hour).padStart(2, "0") : "";
+    return `
+      <div class="hour-bar" data-hour="${tick}" title="${escapeHtml(label)}">
+        <b style="height:${heightPct}%"></b>
+      </div>
+    `;
+  }).join("");
+  els.hoursWrap.innerHTML = bars;
+  if (total > 0) {
+    setText(
+      els.hoursCaption,
+      `Peak hour: ${String(peakHour).padStart(2, "0")}:00 · ${formatMetric(values[peakHour])} ${METRIC_LABEL[state.metric]}`,
+    );
+  } else {
+    setText(els.hoursCaption, "No counted activity in any hour yet.");
+  }
+}
+
+function updateSubagentShare(days) {
+  if (!els.subagentWrap) return;
+  const rangeTotal = days.reduce((acc, day) => acc + metricValue(day), 0);
+  const subagentTotal = days.reduce(
+    (acc, day) => acc + metricValue(day.subagentUsage || {}),
+    0,
+  );
+  const mainTotal = Math.max(rangeTotal - subagentTotal, 0);
+  if (rangeTotal <= 0) {
+    els.subagentWrap.innerHTML = "";
+    setText(els.subagentCaption, "No counted Claude activity in range.");
+    return;
+  }
+  const subagentPct = (subagentTotal / rangeTotal) * 100;
+  const mainPct = (mainTotal / rangeTotal) * 100;
+  els.subagentWrap.innerHTML = `
+    <div class="subagent-bar" title="${escapeHtml(`Subagents: ${formatMetric(subagentTotal, "full")}`)}">
+      <b style="width:${subagentPct.toFixed(1)}%"></b>
+    </div>
+    <div class="subagent-stats">
+      <div>
+        <span>Subagent</span>
+        <strong>${formatMetric(subagentTotal)}</strong>
+        <small>${subagentPct < 1 && subagentTotal > 0 ? "<1" : Math.round(subagentPct)}%</small>
+      </div>
+      <div>
+        <span>Main thread</span>
+        <strong>${formatMetric(mainTotal)}</strong>
+        <small>${mainPct < 1 && mainTotal > 0 ? "<1" : Math.round(mainPct)}%</small>
+      </div>
+    </div>
+  `;
+  setText(
+    els.subagentCaption,
+    subagentTotal > 0
+      ? `Subagent share of ${METRIC_LABEL[state.metric]} (Claude only).`
+      : "No subagent activity counted in this range.",
+  );
+}
+
+function secondsIntoDay(iso) {
+  const t = String(iso).slice(11, 19).split(":");
+  return (Number(t[0]) || 0) * 3600 + (Number(t[1]) || 0) * 60 + (Number(t[2]) || 0);
+}
+
+function nextDateKey(dateKey) {
+  const d = new Date(`${dateKey}T12:00:00`);
+  d.setDate(d.getDate() + 1);
+  return d.toISOString().slice(0, 10);
+}
+
+// Split a session into per-local-day segments with start/width as fractions of
+// a 24h day, so each segment can be drawn on its day's track.
+function sessionDaySegments(session) {
+  const startDate = String(session.start).slice(0, 10);
+  const endDate = String(session.end).slice(0, 10);
+  const startSec = secondsIntoDay(session.start);
+  const endSec = secondsIntoDay(session.end);
+  const segments = [];
+  let dateKey = startDate;
+  for (let guard = 0; guard < 400; guard += 1) {
+    const from = dateKey === startDate ? startSec : 0;
+    const to = dateKey === endDate ? endSec : 86400;
+    segments.push({ dateKey, from, to });
+    if (dateKey === endDate) break;
+    dateKey = nextDateKey(dateKey);
+  }
+  return segments;
+}
+
+const DOW_SHORT = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+function updateSessionHistory() {
+  if (!els.historyScroll) return;
+  // Per-project sessions: one row per (day, project) so concurrent work on
+  // different repos shows as separate lanes under the same day.
+  const sessions = (usage.sessions?.byProject || []).filter((s) => s.start);
+  if (!sessions.length) {
+    els.historyScroll.innerHTML = "<p class=\"history-empty\">No sessions recorded yet.</p>";
+    setText(els.historyCaption, "No sessions yet.");
+    if (els.historyLegend) els.historyLegend.innerHTML = "";
+    return;
+  }
+
+  // Token totals per project; seed colors in descending order so the heaviest
+  // projects get the most distinct palette slots (and the legend matches).
+  const projectTokens = new Map();
+  sessions.forEach((s) => {
+    const key = s.project || "unknown";
+    projectTokens.set(key, (projectTokens.get(key) || 0) + Number(s.totalTokens || 0));
+  });
+  const rankedProjects = [...projectTokens.entries()].sort((a, b) => b[1] - a[1]);
+  rankedProjects.forEach(([name]) => colorForProject(name === "unknown" ? "" : name));
+
+  // day -> project -> segments
+  const byDay = new Map();
+  sessions.forEach((session, index) => {
+    const project = session.project || "unknown";
+    sessionDaySegments(session).forEach((seg) => {
+      if (!byDay.has(seg.dateKey)) byDay.set(seg.dateKey, new Map());
+      const projectMap = byDay.get(seg.dateKey);
+      if (!projectMap.has(project)) projectMap.set(project, []);
+      projectMap.get(project).push({ ...seg, index });
+    });
+  });
+
+  const segSpan = (segs) => segs.reduce((acc, seg) => acc + (seg.to - seg.from), 0);
+  const dayKeys = [...byDay.keys()].sort().reverse(); // newest first
+  const rows = [];
+  dayKeys.forEach((dateKey) => {
+    const date = new Date(`${dateKey}T12:00:00`);
+    const projectMap = byDay.get(dateKey);
+    const projects = [...projectMap.keys()].sort((a, b) => segSpan(projectMap.get(b)) - segSpan(projectMap.get(a)));
+    projects.forEach((project, lane) => {
+      const color = colorForProject(project === "unknown" ? "" : project);
+      const blocks = projectMap.get(project)
+        .sort((a, b) => a.from - b.from)
+        .map((seg) => {
+          const left = (seg.from / 86400) * 100;
+          const width = Math.max(((seg.to - seg.from) / 86400) * 100, 0.5);
+          return `<div class="history-block" style="left:${left}%;width:${width}%;background:${color}" data-i="${seg.index}"></div>`;
+        })
+        .join("");
+      rows.push(`
+        <div class="history-row">
+          <span class="history-date">${lane === 0 ? `${DOW_SHORT[date.getDay()]} ${formatDate(dateKey)}` : ""}</span>
+          <span class="history-proj" title="${escapeHtml(project)}"><i style="background:${color}"></i>${escapeHtml(project)}</span>
+          <div class="history-track">${blocks}</div>
+        </div>
+      `);
+    });
+  });
+  els.historyScroll.innerHTML = rows.join("");
+  els.historyScroll._sessions = sessions;
+
+  setText(
+    els.historyCaption,
+    `${fullNumber(sessions.length)} project-sessions across ${fullNumber(dayKeys.length)} days · 2h+ gap = new session · one lane per project`,
+  );
+
+  if (els.historyLegend) {
+    els.historyLegend.innerHTML = rankedProjects
+      .slice(0, 7)
+      .map(([name]) => `<span><i style="background:${colorForProject(name === "unknown" ? "" : name)}"></i>${escapeHtml(name)}</span>`)
+      .join("");
+  }
+}
+
+function showHistoryTip(block) {
+  if (!els.historyTip || !els.historyPanel) return;
+  const sessions = els.historyScroll?._sessions || [];
+  const session = sessions[Number(block.dataset.i)];
+  if (!session) return;
+  const date = new Date(`${String(session.start).slice(0, 10)}T12:00:00`);
+  const startClock = String(session.start).slice(11, 16);
+  const endClock = String(session.end).slice(11, 16);
+  els.historyTip.innerHTML = `
+    <span class="tip-dow">${DOW_SHORT[date.getDay()]} · ${escapeHtml(session.project || session.topProject || "unknown project")}</span>
+    <span class="tip-date">${startClock}–${endClock} · ${durationLabel(session.durationSeconds)}</span>
+    <span class="tip-value">${compactNumber(session.totalTokens)} tokens · ${session.topModel || "—"}</span>
+    <span class="tip-sub">${fullNumber(session.modelCalls)} calls</span>
+  `;
+  const panelRect = els.historyPanel.getBoundingClientRect();
+  const blockRect = block.getBoundingClientRect();
+  els.historyTip.style.left = `${blockRect.left - panelRect.left + blockRect.width / 2}px`;
+  els.historyTip.style.top = `${blockRect.top - panelRect.top}px`;
+  els.historyTip.hidden = false;
+}
+
 function render() {
   const days = getRangeDays();
   state.hoveredIndex = null;
+  moments = buildMoments();
   updatePersonalityLayer();
   updateSummary();
   updateModelMix(days);
   updateHighlights();
   updateCapture(days);
   updateTable(days);
+  updateHeatmap();
+  updateHoursHistogram(days);
+  updateSubagentShare(days);
+  updateSessionHistory();
   drawChart();
 }
 
@@ -1187,12 +1854,82 @@ document.querySelectorAll("[data-range]").forEach((button) => {
   });
 });
 
+document.querySelectorAll("[data-metric]").forEach((button) => {
+  button.addEventListener("click", () => {
+    document.querySelectorAll("[data-metric]").forEach((btn) => btn.classList.remove("active"));
+    button.classList.add("active");
+    state.metric = button.dataset.metric;
+    render();
+  });
+});
+
+if (els.heatmapPeriod) {
+  els.heatmapPeriod.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-heatmap-period]");
+    if (!button) return;
+    state.heatmapPeriod = button.dataset.heatmapPeriod;
+    renderHeatmapControls();
+    hideHeatmapTip();
+    updateHeatmap();
+  });
+}
+
+if (els.heatmapWrap) {
+  els.heatmapWrap.addEventListener("mouseover", (event) => {
+    const cell = event.target.closest(".heatmap-cell[data-date]");
+    if (!cell) return;
+    showHeatmapTip(cell);
+  });
+  els.heatmapWrap.addEventListener("mouseout", (event) => {
+    const cell = event.target.closest(".heatmap-cell[data-date]");
+    if (cell) cell.classList.remove("is-hovered");
+    if (!event.relatedTarget || !event.relatedTarget.closest?.(".heatmap-cell[data-date]")) {
+      hideHeatmapTip();
+    }
+  });
+}
+
 if (els.sessionToggle) {
   els.sessionToggle.addEventListener("click", () => {
     state.showSessionLine = !state.showSessionLine;
     els.sessionToggle.classList.toggle("active", state.showSessionLine);
     els.sessionToggle.setAttribute("aria-pressed", String(state.showSessionLine));
     drawChart();
+  });
+}
+
+function toggleIsolatedModel(name) {
+  if (!name) return;
+  state.isolatedModel = state.isolatedModel === name ? null : name;
+  render();
+}
+
+if (els.historyScroll) {
+  els.historyScroll.addEventListener("mouseover", (event) => {
+    const block = event.target.closest(".history-block[data-i]");
+    if (block) showHistoryTip(block);
+  });
+  els.historyScroll.addEventListener("mouseout", (event) => {
+    if (!event.relatedTarget || !event.relatedTarget.closest?.(".history-block[data-i]")) {
+      if (els.historyTip) els.historyTip.hidden = true;
+    }
+  });
+  els.historyScroll.addEventListener("scroll", () => {
+    if (els.historyTip) els.historyTip.hidden = true;
+  });
+}
+
+if (els.modelMix) {
+  els.modelMix.addEventListener("click", (event) => {
+    const row = event.target.closest(".model-row[data-model]");
+    if (row) toggleIsolatedModel(row.dataset.model);
+  });
+  els.modelMix.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    const row = event.target.closest(".model-row[data-model]");
+    if (!row) return;
+    event.preventDefault();
+    toggleIsolatedModel(row.dataset.model);
   });
 }
 
@@ -1229,4 +1966,5 @@ window.addEventListener("resize", () => {
   drawChart();
 });
 
+renderHeatmapControls();
 render();

@@ -20,12 +20,14 @@ DASHBOARD_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = DASHBOARD_ROOT / "data"
 CODEX_ROOT = Path.home() / ".codex"
 CLAUDE_PROJECTS_ROOT = Path.home() / ".claude" / "projects"
+OPENCODE_DB_PATH = Path.home() / ".local" / "share" / "opencode" / "opencode.db"
 DEFAULT_TIMEZONE = "America/New_York"
 
 USAGE_KEYS = (
     "totalTokens",
     "inputTokens",
     "cachedInputTokens",
+    "cacheCreationTokens",
     "freshInputTokens",
     "outputTokens",
     "reasoningOutputTokens",
@@ -35,6 +37,7 @@ USAGE_KEYS = (
 PROVIDER_NAMES = {
     "codex": "Codex",
     "claude": "Claude Code",
+    "opencode": "OpenCode",
     "mixed": "Mixed",
 }
 
@@ -46,50 +49,9 @@ TOOL_CALL_RESPONSE_TYPES = {
     "tool_search_call",
 }
 
-GENERIC_MODEL_RATE = {
-    "freshInputTokens": 1.75,
-    "cachedInputTokens": 0.175,
-    "outputTokens": 14.0,
-}
-
-MODEL_PRICE_MAP = (
-    (re.compile(r"gpt-5\.5", re.I), {
-        "freshInputTokens": 5.0,
-        "cachedInputTokens": 0.50,
-        "outputTokens": 30.0,
-    }),
-    (re.compile(r"gpt-5\.4-mini", re.I), {
-        "freshInputTokens": 0.75,
-        "cachedInputTokens": 0.075,
-        "outputTokens": 4.5,
-    }),
-    (re.compile(r"gpt-5\.4", re.I), {
-        "freshInputTokens": 2.5,
-        "cachedInputTokens": 0.25,
-        "outputTokens": 15.0,
-    }),
-    (re.compile(r"gpt-5\.[0-9]+-codex-mini|gpt-5.*mini|codex-mini", re.I), {
-        "freshInputTokens": 1.5,
-        "cachedInputTokens": 0.375,
-        "outputTokens": 6.0,
-    }),
-    (re.compile(r"gpt-5\.[0-9]+-codex|gpt-5-codex|gpt-5\.[0-9]+|gpt-5\b", re.I), GENERIC_MODEL_RATE),
-    (re.compile(r"claude.*haiku", re.I), {
-        "freshInputTokens": 1.0,
-        "cachedInputTokens": 0.10,
-        "outputTokens": 5.0,
-    }),
-    (re.compile(r"claude.*sonnet", re.I), {
-        "freshInputTokens": 3.0,
-        "cachedInputTokens": 0.30,
-        "outputTokens": 15.0,
-    }),
-    (re.compile(r"claude.*opus", re.I), {
-        "freshInputTokens": 5.0,
-        "cachedInputTokens": 0.50,
-        "outputTokens": 25.0,
-    }),
-)
+# Token pricing lives client-side in data/pricing.js as the single source of
+# truth (editable without re-running the importer). The "street value"
+# highlight is computed in app.js from that table.
 
 
 @dataclass(frozen=True)
@@ -112,10 +74,31 @@ class UsageEvent:
     timestamp: datetime
     model: str
     usage: dict[str, int]
+    subagent: bool = False
+    project: str = ""
 
 
 def get_local_tz() -> ZoneInfo:
     return ZoneInfo(os.environ.get("DASHBOARD_TIMEZONE") or DEFAULT_TIMEZONE)
+
+
+def omit_project_names() -> bool:
+    return bool(os.environ.get("DASHBOARD_OMIT_PROJECT_NAMES"))
+
+
+def project_name(raw: str | None) -> str:
+    """Best-effort project label from a working directory. Strips Claude Code
+    worktree suffixes (.../<repo>/.claude/worktrees/...) back to the repo, then
+    takes the final path segment. Honors DASHBOARD_OMIT_PROJECT_NAMES."""
+    if not raw or omit_project_names():
+        return ""
+    text = str(raw)
+    marker = "/.claude/"
+    if marker in text:
+        text = text.split(marker, 1)[0]
+    text = text.rstrip("/")
+    name = text.rsplit("/", 1)[-1] if "/" in text else text
+    return name or ""
 
 
 def normalize_owner_handle(value: str | None) -> str | None:
@@ -182,6 +165,13 @@ def get_claude_projects_source() -> SourceDir:
     if override:
         return SourceDir(Path(override).expanduser(), "DASHBOARD_CLAUDE_PROJECTS_DIR")
     return SourceDir(CLAUDE_PROJECTS_ROOT, "~/.claude/projects")
+
+
+def get_opencode_db_source() -> SourceDir:
+    override = os.environ.get("DASHBOARD_OPENCODE_DB")
+    if override:
+        return SourceDir(Path(override).expanduser(), "DASHBOARD_OPENCODE_DB")
+    return SourceDir(OPENCODE_DB_PATH, "~/.local/share/opencode/opencode.db")
 
 
 def get_codex_logs_db_path() -> Path:
@@ -320,15 +310,6 @@ def format_compact_number(value: int | float) -> str:
     return f"{int(round(value)):,}"
 
 
-def format_compact_money(value: float) -> str:
-    value = float(value or 0)
-    if value >= 1_000_000:
-        return "$" + f"{value / 1_000_000:.1f}".rstrip("0").rstrip(".") + "M"
-    if value >= 1_000:
-        return "$" + f"{value / 1_000:.1f}".rstrip("0").rstrip(".") + "K"
-    return f"${int(round(value)):,}"
-
-
 def set_model_provider(target: dict, provider_id: str) -> None:
     next_provider = provider_name(provider_id)
     existing = target.get("provider")
@@ -338,36 +319,18 @@ def set_model_provider(target: dict, provider_id: str) -> None:
         target["provider"] = PROVIDER_NAMES["mixed"]
 
 
-def rate_for_model(model: str) -> tuple[dict[str, float], bool]:
-    for pattern, rate in MODEL_PRICE_MAP:
-        if pattern.search(model):
-            return rate, False
-    return GENERIC_MODEL_RATE, True
-
-
-def build_api_street_value(model_rows: list[dict]) -> dict:
-    total_usd = 0.0
-    estimated = False
-    for model in model_rows:
-        rate, model_estimated = rate_for_model(str(model.get("name") or "unknown"))
-        usd = sum((int(model.get(key) or 0) / 1_000_000) * rate[key] for key in rate)
-        total_usd += usd
-        estimated = estimated or model_estimated
-    return {
-        "usd": round(total_usd, 4),
-        "estimated": estimated,
-    }
-
-
-def peak_concurrent_codex_terminals(db_path: Path, local_tz: ZoneInfo, earliest_date: str | None = None) -> dict | None:
+def peak_concurrent_by_day(db_path: Path, local_tz: ZoneInfo, earliest_date: str | None = None) -> dict[str, int]:
+    """Peak concurrent Codex processes in any one hour, bucketed by local day,
+    so the dashboard can take the max over whatever date range is selected."""
     if not db_path.exists():
-        return None
+        return {}
     cutoff_ts = 0
     if earliest_date:
         parsed = parse_timestamp(f"{earliest_date}T00:00:00+00:00")
         cutoff_ts = int(parsed.timestamp()) if parsed else 0
     conn = None
     cursor = None
+    by_day: dict[str, int] = {}
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         cursor = conn.execute(
@@ -376,38 +339,36 @@ def peak_concurrent_codex_terminals(db_path: Path, local_tz: ZoneInfo, earliest_
             FROM logs
             WHERE ts >= ? AND process_uuid IS NOT NULL AND process_uuid != ''
             GROUP BY hour_ts
-            ORDER BY process_count DESC, hour_ts DESC
-            LIMIT 1
             """,
             (cutoff_ts,),
         )
-        row = cursor.fetchone()
+        for hour_ts, process_count in cursor.fetchall():
+            try:
+                day_key = datetime.fromtimestamp(int(hour_ts), timezone.utc).astimezone(local_tz).date().isoformat()
+            except (TypeError, ValueError, OSError):
+                continue
+            by_day[day_key] = max(by_day.get(day_key, 0), int(process_count))
     except sqlite3.Error:
-        return None
+        return {}
     finally:
         if cursor:
             cursor.close()
         if conn:
             conn.close()
-
-    if not row:
-        return None
-
-    hour_ts, process_count = row
-    try:
-        hour_label = datetime.fromtimestamp(int(hour_ts), timezone.utc).astimezone(local_tz).isoformat()
-    except (TypeError, ValueError, OSError):
-        return None
-    return {
-        "count": int(process_count),
-        "hour": hour_label,
-        "date": hour_label[:10],
-    }
+    return by_day
 
 
-def codex_session_records(source_dirs: list[SourceDir], local_tz: ZoneInfo) -> dict[str, dict | None]:
-    best_task_turn: tuple[int, datetime] | None = None
-    best_tool_pileup: tuple[int, datetime | None] | None = None
+def codex_session_records_by_day(source_dirs: list[SourceDir], local_tz: ZoneInfo) -> dict[str, dict]:
+    """Per-local-day Codex records: longest single task turn (seconds) and the
+    biggest tool-call pileup in one session. Bucketed by day so the dashboard
+    can take the max over whatever date range is selected."""
+    by_day: dict[str, dict] = {}
+
+    def bump(day_key: str, field: str, value: int) -> None:
+        bucket = by_day.setdefault(day_key, {"longestTaskTurnSeconds": 0, "toolCallPileup": 0})
+        if value > bucket[field]:
+            bucket[field] = value
+
     for session_file in iter_session_files(source_dirs):
         started_by_turn: dict[str, datetime] = {}
         tool_calls = 0
@@ -454,60 +415,40 @@ def codex_session_records(source_dirs: list[SourceDir], local_tz: ZoneInfo) -> d
                         duration = max(int((event_ts - started_at).total_seconds()), 0)
                         if duration > MAX_DEFENSIBLE_TASK_TURN_SECONDS:
                             continue
-                        if not best_task_turn or duration > best_task_turn[0]:
-                            best_task_turn = (duration, started_at)
-        if tool_calls and (not best_tool_pileup or tool_calls > best_tool_pileup[0]):
-            best_tool_pileup = (tool_calls, first_tool_call_at)
+                        bump(started_at.astimezone(local_tz).date().isoformat(), "longestTaskTurnSeconds", duration)
+        if tool_calls and first_tool_call_at:
+            bump(first_tool_call_at.astimezone(local_tz).date().isoformat(), "toolCallPileup", tool_calls)
 
-    task_turn = None
-    if best_task_turn:
-        local_start = best_task_turn[1].astimezone(local_tz)
-        task_turn = {
-            "durationSeconds": best_task_turn[0],
-            "date": local_start.date().isoformat(),
-        }
-
-    tool_pileup = None
-    if best_tool_pileup:
-        local_tool_start = best_tool_pileup[1].astimezone(local_tz) if best_tool_pileup[1] else None
-        tool_pileup = {
-            "count": best_tool_pileup[0],
-            "date": local_tool_start.date().isoformat() if local_tool_start else None,
-        }
-
-    return {
-        "longestTaskTurn": task_turn,
-        "toolCallPileup": tool_pileup,
-    }
+    return by_day
 
 
-def build_highlights(days: list[dict], model_rows: list[dict], codex_sources: list[SourceDir], local_tz: ZoneInfo) -> dict:
+def build_highlights(days: list[dict], session_summary: dict | None = None) -> dict:
+    """All-time highlights, derived from the per-day fields already attached to
+    `days` (peakConcurrentTerminals, longestTaskTurnSeconds, toolCallPileup) plus
+    the session summary. The dashboard recomputes range-scoped versions from the
+    same per-day fields client-side."""
     most_tokens_day = max(days, key=lambda day: int(day.get("totalTokens") or 0), default=None)
-    longest_session_day = max(days, key=lambda day: int(day.get("sessionDurationSeconds") or 0), default=None)
-    street_value = build_api_street_value(model_rows)
-    peak_concurrency = peak_concurrent_codex_terminals(
-        get_codex_logs_db_path(),
-        local_tz,
-        days[0]["date"] if days else None,
-    )
-    session_records = codex_session_records(codex_sources, local_tz)
-    task_turn = session_records["longestTaskTurn"]
-    tool_pileup = session_records["toolCallPileup"]
+    session_summary = session_summary or {}
+    longest_seconds = int(session_summary.get("longestSeconds") or 0)
+    longest_date = session_summary.get("longestStartDate")
+    gap_minutes = int(session_summary.get("gapMinutes") or 0)
+
+    def best_day(field: str):
+        candidate = max(days, key=lambda day: int(day.get(field) or 0), default=None)
+        if candidate and int(candidate.get(field) or 0) > 0:
+            return candidate
+        return None
+
+    concurrency_day = best_day("peakConcurrentTerminals")
+    task_turn_day = best_day("longestTaskTurnSeconds")
+    tool_pileup_day = best_day("toolCallPileup")
     return {
-        "streetValue": {
-            "label": "Street value",
-            "value": format_compact_money(street_value["usd"]),
-            "detail": "API-grade token contraband at public rack rates.",
-            "usd": street_value["usd"],
-            "estimated": bool(street_value["estimated"]),
-            "source": "model_totals",
-        },
         "peakConcurrentTerminals": {
             "label": "Terminal swarm",
-            "value": f"{peak_concurrency['count']:,}" if peak_concurrency else "N/A",
-            "detail": "Peak Codex processes in one local hour." if peak_concurrency else "No local Codex log database found.",
-            "date": peak_concurrency["date"] if peak_concurrency else None,
-            "count": peak_concurrency["count"] if peak_concurrency else None,
+            "value": f"{int(concurrency_day['peakConcurrentTerminals']):,}" if concurrency_day else "N/A",
+            "detail": "Peak Codex processes in one local hour." if concurrency_day else "No local Codex log database found.",
+            "date": concurrency_day["date"] if concurrency_day else None,
+            "count": int(concurrency_day["peakConcurrentTerminals"]) if concurrency_day else None,
             "source": "codex_logs",
         },
         "peakDay": {
@@ -520,26 +461,26 @@ def build_highlights(days: list[dict], model_rows: list[dict], codex_sources: li
         },
         "longestSession": {
             "label": "Longest session",
-            "value": format_duration(int(longest_session_day["sessionDurationSeconds"])) if longest_session_day else "N/A",
-            "detail": f"{longest_session_day['date']} kept the lights on." if longest_session_day else "No session span found.",
-            "date": longest_session_day["date"] if longest_session_day else None,
-            "seconds": int(longest_session_day["sessionDurationSeconds"]) if longest_session_day else None,
-            "source": "daily_usage",
+            "value": format_duration(longest_seconds) if longest_seconds else "N/A",
+            "detail": f"{longest_date} ran longest without a {gap_minutes}m+ break." if longest_date and longest_seconds else "No continuous session found.",
+            "date": longest_date,
+            "seconds": longest_seconds,
+            "source": "sessions",
         },
         "longestTaskTurn": {
             "label": "Longest task turn",
-            "value": format_duration(task_turn["durationSeconds"]) if task_turn else "N/A",
-            "detail": f"{task_turn['date']} had one agent on the clock." if task_turn else "No paired task turn events found.",
-            "date": task_turn["date"] if task_turn else None,
-            "seconds": task_turn["durationSeconds"] if task_turn else None,
+            "value": format_duration(int(task_turn_day["longestTaskTurnSeconds"])) if task_turn_day else "N/A",
+            "detail": f"{task_turn_day['date']} had one agent on the clock." if task_turn_day else "No paired task turn events found.",
+            "date": task_turn_day["date"] if task_turn_day else None,
+            "seconds": int(task_turn_day["longestTaskTurnSeconds"]) if task_turn_day else None,
             "source": "codex_task_events",
         },
         "toolCallPileup": {
             "label": "Tool pileup",
-            "value": format_compact_number(tool_pileup["count"]) if tool_pileup else "N/A",
-            "detail": "Most tool calls packed into one session." if tool_pileup else "No tool calls found.",
-            "date": tool_pileup["date"] if tool_pileup else None,
-            "count": tool_pileup["count"] if tool_pileup else None,
+            "value": format_compact_number(int(tool_pileup_day["toolCallPileup"])) if tool_pileup_day else "N/A",
+            "detail": "Most tool calls packed into one session." if tool_pileup_day else "No tool calls found.",
+            "date": tool_pileup_day["date"] if tool_pileup_day else None,
+            "count": int(tool_pileup_day["toolCallPileup"]) if tool_pileup_day else None,
             "source": "codex_response_items",
         },
     }
@@ -557,6 +498,7 @@ def import_codex_usage(source_dirs: list[SourceDir]) -> tuple[list[UsageEvent], 
     current_model_by_file: dict[str, str] = {
         path: normalize_model(meta.model) for path, meta in metas.items() if meta.model
     }
+    current_project_by_file: dict[str, str] = {}
     stats = {
         "sessionFiles": len(session_files),
         "matchedRelevantEvents": 0,
@@ -582,6 +524,9 @@ def import_codex_usage(source_dirs: list[SourceDir]) -> tuple[list[UsageEvent], 
             payload = obj.get("payload") or {}
             settings = ((payload.get("collaboration_mode") or {}).get("settings") or {})
             current_model_by_file[str(path)] = normalize_model(payload.get("model") or settings.get("model"))
+            cwd = payload.get("cwd") or settings.get("cwd")
+            if cwd:
+                current_project_by_file[str(path)] = project_name(cwd)
             continue
 
         payload = obj.get("payload") or {}
@@ -629,12 +574,16 @@ def import_codex_usage(source_dirs: list[SourceDir]) -> tuple[list[UsageEvent], 
             "totalTokens": total_tokens,
             "inputTokens": input_tokens,
             "cachedInputTokens": cached_input_tokens,
+            "cacheCreationTokens": 0,
             "freshInputTokens": max(input_tokens - cached_input_tokens, 0),
             "outputTokens": output_tokens,
             "reasoningOutputTokens": reasoning_output_tokens,
             "modelCalls": 1,
         }
-        events.append(UsageEvent("codex", event_ts, model, usage_delta))
+        events.append(UsageEvent(
+            "codex", event_ts, model, usage_delta,
+            project=current_project_by_file.get(str(path), ""),
+        ))
         stats["countedModelCalls"] += 1
 
     return events, stats
@@ -655,6 +604,7 @@ def claude_usage_from_message_usage(raw_usage: dict) -> dict[str, int]:
         "totalTokens": input_tokens + cache_creation_input_tokens + cache_read_input_tokens + output_tokens,
         "inputTokens": input_tokens + cache_creation_input_tokens + cache_read_input_tokens,
         "cachedInputTokens": cache_read_input_tokens,
+        "cacheCreationTokens": cache_creation_input_tokens,
         "freshInputTokens": input_tokens + cache_creation_input_tokens,
         "outputTokens": output_tokens,
         "reasoningOutputTokens": 0,
@@ -679,6 +629,7 @@ def import_claude_usage(projects_source: SourceDir) -> tuple[list[UsageEvent], d
     selected: dict[tuple[str, str], tuple[int, datetime, UsageEvent]] = {}
 
     for transcript_file in transcript_files:
+        is_subagent_file = "/subagents/" in str(transcript_file)
         try:
             handle = transcript_file.open("r", encoding="utf-8", errors="replace")
         except OSError:
@@ -717,7 +668,11 @@ def import_claude_usage(projects_source: SourceDir) -> tuple[list[UsageEvent], d
                 if total_tokens <= 0:
                     stats["zeroTokenEvents"] += 1
                     continue
-                event = UsageEvent("claude", event_ts, model, usage_delta)
+                event = UsageEvent(
+                    "claude", event_ts, model, usage_delta,
+                    subagent=is_subagent_file,
+                    project=project_name(obj.get("cwd")),
+                )
                 dedupe_key = (str(transcript_file), str(message_id))
                 current = selected.get(dedupe_key)
                 stats["candidateUsageEvents"] += 1
@@ -730,6 +685,101 @@ def import_claude_usage(projects_source: SourceDir) -> tuple[list[UsageEvent], d
                     selected[dedupe_key] = (total_tokens, event_ts, event)
 
     events = [item[2] for item in selected.values()]
+    stats["countedModelCalls"] = len(events)
+    return events, stats
+
+
+def opencode_usage_from_tokens(raw_tokens: dict) -> dict[str, int]:
+    cache = raw_tokens.get("cache") or {}
+    input_tokens = int(raw_tokens.get("input") or 0)
+    output_tokens = int(raw_tokens.get("output") or 0)
+    reasoning_tokens = int(raw_tokens.get("reasoning") or 0)
+    cache_read = int(cache.get("read") or 0)
+    cache_write = int(cache.get("write") or 0)
+    declared_total = raw_tokens.get("total")
+    total_tokens = (
+        int(declared_total)
+        if declared_total is not None
+        else input_tokens + output_tokens + reasoning_tokens + cache_read + cache_write
+    )
+    return {
+        "totalTokens": total_tokens,
+        "inputTokens": input_tokens + cache_read + cache_write,
+        "cachedInputTokens": cache_read,
+        "cacheCreationTokens": cache_write,
+        "freshInputTokens": input_tokens + cache_write,
+        "outputTokens": output_tokens,
+        "reasoningOutputTokens": reasoning_tokens,
+        "modelCalls": 1,
+    }
+
+
+def import_opencode_usage(db_source: SourceDir) -> tuple[list[UsageEvent], dict]:
+    stats = {
+        "dbPresent": False,
+        "matchedAssistantEvents": 0,
+        "countedModelCalls": 0,
+        "nullUsageEvents": 0,
+        "zeroTokenEvents": 0,
+        "parseErrors": 0,
+        "unknownModelEvents": 0,
+        "dbErrors": 0,
+    }
+    events: list[UsageEvent] = []
+    if not db_source.path.exists():
+        return events, stats
+    stats["dbPresent"] = True
+
+    uri = f"file:{db_source.path}?mode=ro"
+    try:
+        connection = sqlite3.connect(uri, uri=True)
+    except sqlite3.DatabaseError:
+        stats["dbErrors"] += 1
+        return events, stats
+
+    try:
+        cursor = connection.execute(
+            "SELECT data FROM message WHERE json_extract(data,'$.role')='assistant'"
+        )
+        for (raw,) in cursor:
+            stats["matchedAssistantEvents"] += 1
+            try:
+                obj = json.loads(raw)
+            except (TypeError, json.JSONDecodeError):
+                stats["parseErrors"] += 1
+                continue
+            tokens = obj.get("tokens")
+            raw_model = obj.get("modelID") or obj.get("providerID")
+            if not tokens or not raw_model:
+                stats["nullUsageEvents"] += 1
+                continue
+            created_ms = ((obj.get("time") or {}).get("created"))
+            if created_ms is None:
+                stats["parseErrors"] += 1
+                continue
+            try:
+                event_ts = datetime.fromtimestamp(int(created_ms) / 1000, tz=timezone.utc)
+            except (TypeError, ValueError, OSError):
+                stats["parseErrors"] += 1
+                continue
+
+            model = normalize_model(raw_model)
+            if model == "unknown":
+                stats["unknownModelEvents"] += 1
+            usage_delta = opencode_usage_from_tokens(tokens)
+            if total_token_count(usage_delta) <= 0:
+                stats["zeroTokenEvents"] += 1
+                continue
+            opencode_cwd = ((obj.get("path") or {}).get("cwd")) or ((obj.get("path") or {}).get("root"))
+            events.append(UsageEvent(
+                "opencode", event_ts, model, usage_delta,
+                project=project_name(opencode_cwd),
+            ))
+    except sqlite3.DatabaseError:
+        stats["dbErrors"] += 1
+    finally:
+        connection.close()
+
     stats["countedModelCalls"] = len(events)
     return events, stats
 
@@ -759,19 +809,188 @@ def provider_row(
     }
 
 
+def get_session_gap_seconds() -> int:
+    raw = os.environ.get("DASHBOARD_SESSION_GAP_MINUTES")
+    try:
+        minutes = float(raw) if raw else 120.0
+    except (TypeError, ValueError):
+        minutes = 120.0
+    return int(max(minutes, 1.0) * 60)
+
+
+def _top_key(tally: dict[str, int]) -> str:
+    return max(tally.items(), key=lambda kv: kv[1])[0] if tally else ""
+
+
+def compute_sessions(events: list[UsageEvent], gap_seconds: int, split_by_project: bool = True) -> list[dict]:
+    """Group events into continuous sessions. A session ends when the silent
+    gap between consecutive events exceeds gap_seconds, or (when
+    split_by_project) when the working project changes — so a session is
+    continuous work on one project. Sessions span midnight and ignore in-session
+    resets like /clear. Each session tracks its dominant model and project."""
+    if not events:
+        return []
+    ordered = sorted(events, key=lambda event: event.timestamp)
+
+    def fresh(event: UsageEvent) -> dict:
+        return {
+            "start": event.timestamp,
+            "end": event.timestamp,
+            "tokens": 0,
+            "calls": 0,
+            "models": {},
+            "projects": {},
+            "project": event.project or "",
+        }
+
+    def absorb(session: dict, event: UsageEvent) -> None:
+        value = total_token_count(event.usage)
+        session["end"] = event.timestamp
+        session["tokens"] += value
+        session["calls"] += 1
+        if event.model:
+            session["models"][event.model] = session["models"].get(event.model, 0) + value
+        if event.project:
+            session["projects"][event.project] = session["projects"].get(event.project, 0) + value
+            if not session["project"]:
+                session["project"] = event.project
+
+    sessions: list[dict] = []
+    current = fresh(ordered[0])
+    absorb(current, ordered[0])
+    for event in ordered[1:]:
+        gap_break = (event.timestamp - current["end"]).total_seconds() > gap_seconds
+        project_break = (
+            split_by_project
+            and bool(event.project)
+            and bool(current["project"])
+            and event.project != current["project"]
+        )
+        if gap_break or project_break:
+            sessions.append(current)
+            current = fresh(event)
+        absorb(current, event)
+    sessions.append(current)
+    return sessions
+
+
+def active_seconds_by_day(sessions: list[dict], local_tz: ZoneInfo) -> dict[str, int]:
+    """Split each session's elapsed time across the local days it touches, so a
+    day's 'active time' is real focus time, not first-to-last-of-day."""
+    active: dict[str, float] = {}
+    for session in sessions:
+        cursor = session["start"].astimezone(local_tz)
+        end_local = session["end"].astimezone(local_tz)
+        active.setdefault(cursor.date().isoformat(), 0.0)
+        while cursor < end_local:
+            next_midnight = (cursor + timedelta(days=1)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            segment_end = min(next_midnight, end_local)
+            day_key = cursor.date().isoformat()
+            active[day_key] = active.get(day_key, 0.0) + (segment_end - cursor).total_seconds()
+            cursor = segment_end
+    return {key: int(value) for key, value in active.items()}
+
+
+def summarize_sessions(sessions: list[dict], gap_seconds: int, local_tz: ZoneInfo) -> dict:
+    durations = sorted(int((s["end"] - s["start"]).total_seconds()) for s in sessions)
+    longest = max(
+        sessions,
+        key=lambda s: (s["end"] - s["start"]).total_seconds(),
+        default=None,
+    )
+    median_seconds = 0
+    if durations:
+        mid = len(durations) // 2
+        median_seconds = (
+            durations[mid]
+            if len(durations) % 2
+            else (durations[mid - 1] + durations[mid]) // 2
+        )
+    return {
+        "count": len(sessions),
+        "gapMinutes": gap_seconds // 60,
+        "longestSeconds": int((longest["end"] - longest["start"]).total_seconds()) if longest else 0,
+        "longestStartDate": longest["start"].astimezone(local_tz).date().isoformat() if longest else None,
+        "medianSeconds": median_seconds,
+        "totalActiveSeconds": sum(durations),
+        # Per-session detail for the history timeline + range-scoped longest
+        # session. Times are local ISO so the client can place blocks on a day.
+        "list": [
+            {
+                "start": s["start"].astimezone(local_tz).isoformat(),
+                "end": s["end"].astimezone(local_tz).isoformat(),
+                "startDate": s["start"].astimezone(local_tz).date().isoformat(),
+                "durationSeconds": int((s["end"] - s["start"]).total_seconds()),
+                "totalTokens": int(s.get("tokens") or 0),
+                "modelCalls": int(s.get("calls") or 0),
+                "topModel": _top_key(s.get("models") or {}),
+                "topProject": _top_key(s.get("projects") or {}),
+            }
+            for s in sessions
+        ],
+    }
+
+
+def project_session_rows(events: list[UsageEvent], gap_seconds: int, local_tz: ZoneInfo) -> list[dict]:
+    """Sessionize each project's events independently (gap only). Returns one
+    row per per-project session for the history timeline, so concurrent work on
+    different repos lands in separate rows rather than a single mixed block."""
+    by_project: dict[str, list[UsageEvent]] = {}
+    for event in events:
+        by_project.setdefault(event.project or "", []).append(event)
+
+    rows: list[dict] = []
+    for project, project_events in by_project.items():
+        for session in compute_sessions(project_events, gap_seconds, split_by_project=False):
+            rows.append({
+                "start": session["start"].astimezone(local_tz).isoformat(),
+                "end": session["end"].astimezone(local_tz).isoformat(),
+                "startDate": session["start"].astimezone(local_tz).date().isoformat(),
+                "durationSeconds": int((session["end"] - session["start"]).total_seconds()),
+                "totalTokens": int(session.get("tokens") or 0),
+                "modelCalls": int(session.get("calls") or 0),
+                "topModel": _top_key(session.get("models") or {}),
+                "project": project,
+            })
+    rows.sort(key=lambda row: row["start"])
+    return rows
+
+
 def build_usage() -> dict:
     local_tz = get_local_tz()
     codex_sources = get_codex_source_dirs()
     claude_source = get_claude_projects_source()
+    opencode_source = get_opencode_db_source()
     codex_events, codex_stats = import_codex_usage(codex_sources)
     claude_events, claude_stats = import_claude_usage(claude_source)
-    all_events = [*codex_events, *claude_events]
+    opencode_events, opencode_stats = import_opencode_usage(opencode_source)
+    all_events = [*codex_events, *claude_events, *opencode_events]
+
+    session_gap_seconds = get_session_gap_seconds()
+    # Global sessions are activity-union (gap only): used for per-day active time
+    # and the longest-session highlight, with no double counting across parallel
+    # projects.
+    sessions = compute_sessions(all_events, session_gap_seconds, split_by_project=False)
+    active_by_day = active_seconds_by_day(sessions, local_tz)
+    session_summary = summarize_sessions(sessions, session_gap_seconds, local_tz)
+    # Per-project sessions for the history timeline: each project's events are
+    # sessionized independently so concurrent work on different repos shows as
+    # separate lanes instead of shredding into micro-sessions.
+    session_summary["byProject"] = project_session_rows(all_events, session_gap_seconds, local_tz)
+
+    # Per-day Codex records so the dashboard can take the max over any range.
+    concurrency_by_day = peak_concurrent_by_day(get_codex_logs_db_path(), local_tz)
+    codex_records_by_day = codex_session_records_by_day(codex_sources, local_tz)
 
     by_day: dict[str, dict[str, int]] = {}
     model_totals: dict[str, dict[str, int]] = {}
+    hours_of_day = [empty_day() for _ in range(24)]
 
     for event in all_events:
-        day_key = event.timestamp.astimezone(local_tz).date().isoformat()
+        local_ts = event.timestamp.astimezone(local_tz)
+        day_key = local_ts.date().isoformat()
         day = by_day.setdefault(
             day_key,
             {
@@ -780,9 +999,15 @@ def build_usage() -> dict:
                 "lastTokenAt": None,
                 "sessionDurationSeconds": 0,
                 "models": {},
+                "subagentUsage": empty_day(),
+                "hours": {},
             },
         )
         add_usage(day, event.usage)
+        if event.subagent:
+            add_usage(day["subagentUsage"], event.usage)
+        hour_bucket = day["hours"].setdefault(local_ts.hour, empty_day())
+        add_usage(hour_bucket, event.usage)
         day["firstTokenAt"] = (
             min(day["firstTokenAt"], event.timestamp.isoformat()) if day["firstTokenAt"] else event.timestamp.isoformat()
         )
@@ -795,12 +1020,13 @@ def build_usage() -> dict:
         model_total = model_totals.setdefault(event.model, empty_day())
         set_model_provider(model_total, event.provider)
         add_usage(model_total, event.usage)
+        add_usage(hours_of_day[local_ts.hour], event.usage)
 
     days = []
     for date_key, values in sorted(by_day.items()):
-        first_at = parse_timestamp(values["firstTokenAt"])
-        last_at = parse_timestamp(values["lastTokenAt"])
-        duration = int((last_at - first_at).total_seconds()) if first_at and last_at else 0
+        # Active time = sum of gap-based session time that falls on this local
+        # day, not first-token-to-last-token (which inflated quiet days to ~24h).
+        duration = active_by_day.get(date_key, 0)
         model_rows = [
             {"name": model, **usage_values}
             for model, usage_values in sorted(
@@ -809,10 +1035,19 @@ def build_usage() -> dict:
                 reverse=True,
             )
         ]
-        clean_values = {key: value for key, value in values.items() if key != "models"}
+        codex_record = codex_records_by_day.get(date_key) or {}
+        clean_values = {key: value for key, value in values.items() if key not in ("models", "hours")}
         clean_values["sessionDurationSeconds"] = duration
+        clean_values["peakConcurrentTerminals"] = int(concurrency_by_day.get(date_key, 0))
+        clean_values["longestTaskTurnSeconds"] = int(codex_record.get("longestTaskTurnSeconds", 0))
+        clean_values["toolCallPileup"] = int(codex_record.get("toolCallPileup", 0))
         clean_values["models"] = model_rows
+        clean_values["hours"] = {str(hour): bucket for hour, bucket in sorted(values["hours"].items())}
         days.append({"date": date_key, **clean_values})
+
+    subagent_totals = empty_day()
+    for day in days:
+        add_usage(subagent_totals, day.get("subagentUsage", {}))
 
     totals = empty_day()
     for day in days:
@@ -842,41 +1077,68 @@ def build_usage() -> dict:
             claude_stats["transcriptFiles"],
             claude_events,
         ),
+        provider_row(
+            "opencode",
+            "OpenCode",
+            [opencode_source.label],
+            1 if opencode_stats["dbPresent"] else 0,
+            opencode_events,
+        ),
     ]
     stats = {
         **codex_stats,
         "countedModelCalls": len(all_events),
-        "nullUsageEvents": codex_stats["nullUsageEvents"] + claude_stats["nullUsageEvents"],
-        "parseErrors": codex_stats["parseErrors"] + claude_stats["parseErrors"],
-        "unknownModelEvents": codex_stats["unknownModelEvents"] + claude_stats["unknownModelEvents"],
+        "nullUsageEvents": (
+            codex_stats["nullUsageEvents"]
+            + claude_stats["nullUsageEvents"]
+            + opencode_stats["nullUsageEvents"]
+        ),
+        "parseErrors": (
+            codex_stats["parseErrors"]
+            + claude_stats["parseErrors"]
+            + opencode_stats["parseErrors"]
+        ),
+        "unknownModelEvents": (
+            codex_stats["unknownModelEvents"]
+            + claude_stats["unknownModelEvents"]
+            + opencode_stats["unknownModelEvents"]
+        ),
         "providers": {
             "codex": codex_stats,
             "claude": claude_stats,
+            "opencode": opencode_stats,
         },
     }
-    stats["highlights"] = build_highlights(days, model_rows, codex_sources, local_tz)
+    stats["highlights"] = build_highlights(days, session_summary)
 
     return {
         "schemaVersion": 2,
         "generatedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "ownerHandle": infer_owner_handle(),
         "timezone": str(local_tz),
-        "sourceDirs": [source.label for source in codex_sources if source.path.exists()] + (
-            [claude_source.label] if claude_source.path.exists() else []
+        "sourceDirs": (
+            [source.label for source in codex_sources if source.path.exists()]
+            + ([claude_source.label] if claude_source.path.exists() else [])
+            + ([opencode_source.label] if opencode_source.path.exists() else [])
         ),
         "firstDate": days[0]["date"] if days else None,
         "lastDate": days[-1]["date"] if days else None,
         "methodology": {
-            "usageField": "Codex last_token_usage.total_tokens; Claude message.usage token fields.",
-            "modelField": "Codex nearest prior turn_context.payload.model within each session transcript; Claude message.model.",
-            "dedupe": "Codex counts repeated total_token_usage.total_tokens once per session file. Claude keeps one row per transcript path and message.id, choosing the largest token total and latest timestamp on ties.",
-            "forkHandling": "Codex forked/subagent sessions skip token_count events in the first two seconds to avoid copied parent history. Claude subagents/sidechains are included.",
-            "sessionDuration": "Per local day, first counted token event timestamp through last counted token event timestamp.",
-            "highlights": "Aggregate-only all-time highlights. API street value uses fresh input, cached input, and output token classes; Codex reasoning tokens are not double counted because they are already included in output tokens. Long task-turn highlights ignore paired task events over 12 hours to avoid stale resumed tabs. Tool pileup counts tool-call response items per Codex session transcript.",
-            "scope": "Local Codex and Claude Code transcripts only; not account billing truth.",
+            "usageField": "Codex last_token_usage.total_tokens; Claude message.usage token fields; OpenCode message.tokens (input/output/reasoning/cache.read/cache.write) from opencode.db.",
+            "modelField": "Codex nearest prior turn_context.payload.model within each session transcript; Claude message.model; OpenCode message.modelID.",
+            "dedupe": "Codex counts repeated total_token_usage.total_tokens once per session file. Claude keeps one row per transcript path and message.id, choosing the largest token total and latest timestamp on ties. OpenCode reads one row per assistant message (the table is keyed by message id).",
+            "forkHandling": "Codex forked/subagent sessions skip token_count events in the first two seconds to avoid copied parent history. Claude subagents/sidechains are included. OpenCode includes all assistant messages with non-zero tokens.",
+            "sessionDuration": f"Continuous sessions: events across all providers are sorted by time, and a new session starts on a silent gap longer than DASHBOARD_SESSION_GAP_MINUTES ({session_summary['gapMinutes']}m default 120m). Per-day session length is the session time that falls on that local day (cross-midnight sessions are split). In-session resets like /clear do not split a session. The history timeline (sessions.byProject) sessionizes each project's events independently so concurrent work on different repos shows as separate lanes.",
+            "highlights": "Aggregate-only all-time highlights. Long task-turn highlights ignore paired task events over 12 hours to avoid stale resumed tabs. Tool pileup counts tool-call response items per Codex session transcript. API street value is computed client-side from data/pricing.js.",
+            "scope": "Local Codex, Claude Code, and OpenCode transcripts only; not account billing truth.",
         },
         "stats": stats,
         "totals": totals,
+        "sessions": session_summary,
+        "subagentTotals": subagent_totals,
+        "hoursOfDay": [
+            {"hour": hour, **bucket} for hour, bucket in enumerate(hours_of_day)
+        ],
         "models": model_rows,
         "providers": providers,
         "days": days,

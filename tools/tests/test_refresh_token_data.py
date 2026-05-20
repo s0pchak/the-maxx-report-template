@@ -9,6 +9,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 from contextlib import redirect_stdout
 from io import StringIO
@@ -54,16 +55,24 @@ def strings_in(value):
 
 
 class RefreshTokenDataTest(unittest.TestCase):
-    def build_usage(self, fixture_name: str, codex_relative: str, claude_relative: str) -> tuple[dict, Path]:
+    def build_usage(
+        self,
+        fixture_name: str,
+        codex_relative: str,
+        claude_relative: str,
+        opencode_db: Path | None = None,
+    ) -> tuple[dict, Path]:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         root = copy_fixture(fixture_name, Path(tmp.name))
         codex_dirs = root / codex_relative
         claude_dir = root / claude_relative
+        opencode_path = opencode_db if opencode_db is not None else root / "missing-opencode.db"
         with patched_env(
             {
                 "DASHBOARD_CODEX_DIRS": str(codex_dirs),
                 "DASHBOARD_CLAUDE_PROJECTS_DIR": str(claude_dir),
+                "DASHBOARD_OPENCODE_DB": str(opencode_path),
                 "DASHBOARD_CODEX_LOGS_DB": str(root / "missing-logs.sqlite"),
                 "DASHBOARD_TIMEZONE": "UTC",
             }
@@ -107,6 +116,7 @@ class RefreshTokenDataTest(unittest.TestCase):
                 "totalTokens": 42,
                 "inputTokens": 34,
                 "cachedInputTokens": 20,
+                "cacheCreationTokens": 5,
                 "freshInputTokens": 14,
                 "outputTokens": 8,
                 "reasoningOutputTokens": 0,
@@ -134,10 +144,24 @@ class RefreshTokenDataTest(unittest.TestCase):
             "methodology",
             "stats",
             "totals",
+            "subagentTotals",
+            "hoursOfDay",
             "models",
             "days",
         }
         self.assertTrue(expected_fields.issubset(usage.keys()))
+        self.assertEqual(len(usage["hoursOfDay"]), 24)
+        for bucket in usage["hoursOfDay"]:
+            self.assertIn("hour", bucket)
+            self.assertIn("totalTokens", bucket)
+        for day in usage["days"]:
+            self.assertIn("subagentUsage", day)
+            self.assertIn("hours", day)
+            # Per-day fields the dashboard maxes over the selected range.
+            self.assertIn("peakConcurrentTerminals", day)
+            self.assertIn("longestTaskTurnSeconds", day)
+            self.assertIn("toolCallPileup", day)
+        self.assertIsInstance(usage["sessions"]["list"], list)
         self.assertEqual(usage["schemaVersion"], 2)
         self.assertEqual(usage["firstDate"], "2026-01-02")
         self.assertEqual(usage["lastDate"], "2026-01-03")
@@ -157,8 +181,9 @@ class RefreshTokenDataTest(unittest.TestCase):
             {"gpt-5.1-codex-mini": "Codex", "claude-sonnet-4-5": "Claude Code"},
         )
         highlights = usage["stats"]["highlights"]
+        # streetValue is computed client-side from data/pricing.js, so it is no
+        # longer a server-emitted highlight.
         self.assertEqual(set(highlights.keys()), {
-            "streetValue",
             "peakConcurrentTerminals",
             "peakDay",
             "longestSession",
@@ -176,11 +201,76 @@ class RefreshTokenDataTest(unittest.TestCase):
         self.assertEqual(highlights["longestSession"]["date"], "2026-01-02")
         self.assertEqual(highlights["longestSession"]["seconds"], 0)
         self.assertEqual(highlights["toolCallPileup"]["value"], "N/A")
-        self.assertTrue(highlights["streetValue"]["value"].startswith("$"))
-        self.assertFalse(highlights["streetValue"]["estimated"])
         self.assertEqual(highlights["peakConcurrentTerminals"]["value"], "N/A")
         self.assertEqual(highlights["longestTaskTurn"]["value"], "N/A")
+        # Gap-based session summary is present and sane.
+        self.assertEqual(usage["sessions"]["gapMinutes"], 120)
+        self.assertGreaterEqual(usage["sessions"]["count"], 1)
+        self.assertIn("longestSeconds", usage["sessions"])
         self.assert_no_absolute_fixture_paths(usage, root)
+
+    def test_compute_sessions_splits_on_idle_gap(self):
+        base = datetime(2026, 3, 1, 8, 0, 0, tzinfo=timezone.utc)
+        usage_one = {**refresh_token_data.empty_day(), "totalTokens": 10}
+
+        def event(minutes_after):
+            return refresh_token_data.UsageEvent(
+                "claude", base + timedelta(minutes=minutes_after), "claude-opus-4-7", usage_one
+            )
+
+        # 0, 30, 60 min → one session (gaps < 120m).
+        # Then 300 min (4h gap) → new session. Then 320 min (20m later) → same.
+        events = [event(0), event(30), event(60), event(300), event(320)]
+        sessions = refresh_token_data.compute_sessions(events, gap_seconds=120 * 60)
+        self.assertEqual(len(sessions), 2)
+        self.assertEqual(int((sessions[0]["end"] - sessions[0]["start"]).total_seconds()), 60 * 60)
+        self.assertEqual(int((sessions[1]["end"] - sessions[1]["start"]).total_seconds()), 20 * 60)
+        # A tighter 25-minute gap threshold splits the first run at the 30→60 boundary too.
+        tight = refresh_token_data.compute_sessions(events, gap_seconds=25 * 60)
+        self.assertEqual(len(tight), 4)
+
+    def test_project_name_extraction(self):
+        # Repo root, Claude worktree path, Codex/OpenCode plain cwd, parent dir.
+        self.assertEqual(refresh_token_data.project_name("/Users/x/Documents/Github/api"), "api")
+        self.assertEqual(
+            refresh_token_data.project_name("/Users/x/Documents/Github/tina-rs/.claude/worktrees/phase-1"),
+            "tina-rs",
+        )
+        self.assertEqual(refresh_token_data.project_name(""), "")
+        self.assertEqual(refresh_token_data.project_name(None), "")
+
+    def test_sessions_split_by_project_and_track_dominant_model(self):
+        base = datetime(2026, 3, 1, 9, 0, 0, tzinfo=timezone.utc)
+        usage = {**refresh_token_data.empty_day(), "totalTokens": 100}
+
+        def event(minute, model, project):
+            return refresh_token_data.UsageEvent(
+                "claude", base + timedelta(minutes=minute), model, usage, project=project
+            )
+
+        # No gaps, but the project switches alpha -> beta, so it's two sessions.
+        events = [
+            event(0, "claude-opus-4-7", "alpha"),
+            event(10, "claude-opus-4-7", "alpha"),
+            event(20, "claude-haiku-4-5", "beta"),
+        ]
+        split = refresh_token_data.compute_sessions(events, gap_seconds=120 * 60, split_by_project=True)
+        self.assertEqual(len(split), 2)
+        s_alpha = refresh_token_data.summarize_sessions(split, 120 * 60, refresh_token_data.get_local_tz())["list"]
+        self.assertEqual(s_alpha[0]["topProject"], "alpha")
+        self.assertEqual(s_alpha[0]["topModel"], "claude-opus-4-7")
+        self.assertEqual(s_alpha[0]["modelCalls"], 2)
+        self.assertEqual(s_alpha[1]["topProject"], "beta")
+        self.assertEqual(s_alpha[1]["modelCalls"], 1)
+
+        # Opting out keeps it a single mixed-project session (gap-only).
+        merged = refresh_token_data.compute_sessions(events, gap_seconds=120 * 60, split_by_project=False)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["calls"], 3)
+
+        # Unknown-project events do not force a split.
+        with_unknown = [event(0, "claude-opus-4-7", "alpha"), event(5, "claude-opus-4-7", "")]
+        self.assertEqual(len(refresh_token_data.compute_sessions(with_unknown, 120 * 60, split_by_project=True)), 1)
 
     def test_codex_highlights_scan_logs_and_task_turns_without_private_ids(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -263,6 +353,7 @@ class RefreshTokenDataTest(unittest.TestCase):
                     {
                         "DASHBOARD_CODEX_DIRS": str(root / "codex/sessions"),
                         "DASHBOARD_CLAUDE_PROJECTS_DIR": str(root / "claude/projects"),
+                        "DASHBOARD_OPENCODE_DB": str(root / "missing-opencode.db"),
                         "DASHBOARD_TIMEZONE": "UTC",
                     }
                 ):
@@ -274,6 +365,117 @@ class RefreshTokenDataTest(unittest.TestCase):
             js_text = (output_dir / "usage.js").read_text(encoding="utf-8")
             self.assertTrue(js_text.startswith("window.AI_TOKEN_USAGE = "))
             self.assertIn("window.CODEX_TOKEN_USAGE = window.AI_TOKEN_USAGE;", js_text)
+
+    def test_subagent_path_routes_to_subagent_usage_and_fills_hour_bucket(self):
+        usage, root = self.build_usage(
+            "claude-with-subagent",
+            "empty-codex",
+            "claude/projects",
+        )
+
+        days_by_date = {day["date"]: day for day in usage["days"]}
+        day = days_by_date["2026-01-04"]
+        # Main: input=100, output=50. Subagent: input=200, output=80.
+        # totalTokens for the day is 100+50 + 200+80 = 430.
+        self.assertEqual(day["totalTokens"], 430)
+        # Only the subagent path counts toward subagentUsage.
+        self.assertEqual(day["subagentUsage"]["totalTokens"], 280)
+        self.assertEqual(day["subagentUsage"]["outputTokens"], 80)
+        self.assertEqual(usage["subagentTotals"]["totalTokens"], 280)
+
+        # Hour bucket: both events fall in the same UTC date but different hours
+        # (14:30 and 15:00 UTC). Test runs with DASHBOARD_TIMEZONE=UTC so we
+        # land in hour buckets 14 and 15.
+        self.assertEqual(usage["hoursOfDay"][14]["totalTokens"], 150)
+        self.assertEqual(usage["hoursOfDay"][15]["totalTokens"], 280)
+        # Per-day hours mirror the same split, keyed by string hour.
+        self.assertEqual(day["hours"]["14"]["totalTokens"], 150)
+        self.assertEqual(day["hours"]["15"]["totalTokens"], 280)
+        self.assert_no_absolute_fixture_paths(usage, root)
+
+    def test_opencode_db_aggregates_into_provider_row(self):
+        import sqlite3
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db_path = Path(tmp.name) / "opencode.db"
+        connection = sqlite3.connect(db_path)
+        try:
+            connection.execute("CREATE TABLE message (id TEXT PRIMARY KEY, data TEXT NOT NULL)")
+            rows = [
+                (
+                    "msg_real",
+                    {
+                        "role": "assistant",
+                        "modelID": "moonshotai/kimi-k2.6",
+                        "providerID": "openrouter",
+                        "time": {"created": 1736208000000},
+                        "tokens": {
+                            "total": 39194,
+                            "input": 18827,
+                            "output": 240,
+                            "reasoning": 671,
+                            "cache": {"write": 0, "read": 19456},
+                        },
+                    },
+                ),
+                (
+                    "msg_zero",
+                    {
+                        "role": "assistant",
+                        "modelID": "moonshotai/kimi-k2.6",
+                        "providerID": "openrouter",
+                        "time": {"created": 1736208001000},
+                        "tokens": {
+                            "total": 0,
+                            "input": 0,
+                            "output": 0,
+                            "reasoning": 0,
+                            "cache": {"write": 0, "read": 0},
+                        },
+                    },
+                ),
+                (
+                    "msg_user",
+                    {
+                        "role": "user",
+                        "time": {"created": 1736208002000},
+                    },
+                ),
+            ]
+            for msg_id, payload in rows:
+                connection.execute(
+                    "INSERT INTO message (id, data) VALUES (?, ?)",
+                    (msg_id, refresh_token_data.json.dumps(payload)),
+                )
+            connection.commit()
+        finally:
+            connection.close()
+
+        usage, root = self.build_usage(
+            "mixed",
+            "codex/sessions",
+            "claude/projects",
+            opencode_db=db_path,
+        )
+
+        opencode_stats = usage["stats"]["providers"]["opencode"]
+        self.assertTrue(opencode_stats["dbPresent"])
+        self.assertEqual(opencode_stats["matchedAssistantEvents"], 2)
+        self.assertEqual(opencode_stats["zeroTokenEvents"], 1)
+        self.assertEqual(opencode_stats["countedModelCalls"], 1)
+
+        providers_by_id = {provider["id"]: provider for provider in usage["providers"]}
+        self.assertIn("opencode", providers_by_id)
+        self.assertEqual(providers_by_id["opencode"]["totalTokens"], 39194)
+        self.assertEqual(providers_by_id["opencode"]["cachedInputTokens"], 19456)
+        self.assertEqual(providers_by_id["opencode"]["cacheCreationTokens"], 0)
+        self.assertEqual(providers_by_id["opencode"]["reasoningOutputTokens"], 671)
+
+        models_by_name = {model["name"]: model for model in usage["models"]}
+        self.assertIn("moonshotai/kimi-k2.6", models_by_name)
+        self.assertEqual(models_by_name["moonshotai/kimi-k2.6"]["provider"], "OpenCode")
+        self.assert_no_absolute_fixture_paths(usage, root)
 
 
 if __name__ == "__main__":

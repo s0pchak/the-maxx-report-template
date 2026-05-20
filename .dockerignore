@@ -1,0 +1,11 @@
+.git
+.github
+tools
+*.md
+LICENSE
+render.yaml
+netlify.toml
+vercel.json
+fly.toml
+.dockerignore
+Dockerfile
