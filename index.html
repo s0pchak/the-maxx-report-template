@@ -96,6 +96,39 @@
           </section>
         </aside>
       </section>
+
+      <section class="patterns" aria-label="Patterns">
+        <div class="pattern-panel pattern-heatmap">
+          <div class="panel-head">
+            <div>
+              <h2>Calendar Heatmap</h2>
+              <p id="heatmapCaption">--</p>
+            </div>
+            <div class="heatmap-legend" id="heatmapLegend"></div>
+          </div>
+          <div class="heatmap-wrap" id="heatmapWrap" aria-label="Daily activity heatmap"></div>
+        </div>
+
+        <div class="pattern-panel pattern-hours">
+          <div class="panel-head">
+            <div>
+              <h2>Hour Of Day</h2>
+              <p id="hoursCaption">--</p>
+            </div>
+          </div>
+          <div class="hours-wrap" id="hoursWrap" aria-label="Hour of day histogram"></div>
+        </div>
+
+        <div class="pattern-panel pattern-subagent">
+          <div class="panel-head">
+            <div>
+              <h2>Subagent Share</h2>
+              <p id="subagentCaption">--</p>
+            </div>
+          </div>
+          <div class="subagent-wrap" id="subagentWrap" aria-label="Subagent vs main thread share"></div>
+        </div>
+      </section>
     </main>
 
     <script src="./data/usage.js"></script>

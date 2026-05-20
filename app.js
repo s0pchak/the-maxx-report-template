@@ -185,6 +185,13 @@ const els = {
   heroTotalUnit: document.querySelector("#heroTotalUnit"),
   heroCaption: document.querySelector("#heroCaption"),
   planPill: document.querySelector("#planPill"),
+  heatmapWrap: document.querySelector("#heatmapWrap"),
+  heatmapCaption: document.querySelector("#heatmapCaption"),
+  heatmapLegend: document.querySelector("#heatmapLegend"),
+  hoursWrap: document.querySelector("#hoursWrap"),
+  hoursCaption: document.querySelector("#hoursCaption"),
+  subagentWrap: document.querySelector("#subagentWrap"),
+  subagentCaption: document.querySelector("#subagentCaption"),
   heroPeakTokens: document.querySelector("#heroPeakTokens"),
   heroPeakDate: document.querySelector("#heroPeakDate"),
   heroLongestDuration: document.querySelector("#heroLongestDuration"),
@@ -1217,6 +1224,150 @@ function updateTable(days) {
   );
 }
 
+function heatColor(intensity) {
+  if (intensity <= 0) return "rgba(245, 241, 232, 0.06)";
+  const stops = [
+    [0.12, [60, 80, 70]],
+    [0.28, [88, 214, 201]],
+    [0.55, [95, 240, 178]],
+    [0.80, [215, 255, 69]],
+    [1.00, [255, 191, 71]],
+  ];
+  for (let i = 0; i < stops.length; i += 1) {
+    if (intensity <= stops[i][0]) {
+      const prev = i === 0 ? [0, [40, 60, 55]] : stops[i - 1];
+      const next = stops[i];
+      const span = next[0] - prev[0] || 1;
+      const t = (intensity - prev[0]) / span;
+      const r = Math.round(prev[1][0] + (next[1][0] - prev[1][0]) * t);
+      const g = Math.round(prev[1][1] + (next[1][1] - prev[1][1]) * t);
+      const b = Math.round(prev[1][2] + (next[1][2] - prev[1][2]) * t);
+      return `rgb(${r}, ${g}, ${b})`;
+    }
+  }
+  return "rgb(255, 191, 71)";
+}
+
+function updateHeatmap(days) {
+  if (!els.heatmapWrap) return;
+  if (!days.length) {
+    els.heatmapWrap.innerHTML = "";
+    setText(els.heatmapCaption, "No days yet.");
+    return;
+  }
+  const byDate = new Map(days.map((day) => [day.date, day]));
+  const first = new Date(`${days[0].date}T12:00:00`);
+  const last = new Date(`${days[days.length - 1].date}T12:00:00`);
+  // Align the grid so the first column starts on Sunday.
+  const start = new Date(first);
+  start.setDate(start.getDate() - start.getDay());
+  const maxValue = Math.max(...days.map((day) => metricValue(day)), 1);
+  const cells = [];
+  const cursor = new Date(start);
+  while (cursor <= last) {
+    const iso = cursor.toISOString().slice(0, 10);
+    const day = byDate.get(iso);
+    const value = day ? metricValue(day) : 0;
+    const inRange = cursor >= first && cursor <= last;
+    if (!inRange) {
+      cells.push(`<div class="heatmap-cell" data-empty="true"></div>`);
+    } else if (!day || value <= 0) {
+      cells.push(`<div class="heatmap-cell" title="${iso}: no activity"></div>`);
+    } else {
+      const intensity = Math.min(value / maxValue, 1);
+      const color = heatColor(intensity);
+      const label = `${formatDateLong(iso)} · ${formatMetric(value, "full")} ${METRIC_LABEL[state.metric]}`;
+      cells.push(`<div class="heatmap-cell" style="background:${color};border-color:transparent" title="${escapeHtml(label)}"></div>`);
+    }
+    cursor.setDate(cursor.getDate() + 1);
+  }
+  els.heatmapWrap.innerHTML = cells.join("");
+  setText(
+    els.heatmapCaption,
+    `${fullNumber(days.length)} active days · color scaled by ${METRIC_LABEL[state.metric]}`,
+  );
+  if (els.heatmapLegend) {
+    const ramp = [0.05, 0.25, 0.5, 0.75, 1].map((step) => `<i style="background:${heatColor(step)}"></i>`).join("");
+    els.heatmapLegend.innerHTML = `less ${ramp} more`;
+  }
+}
+
+function updateHoursHistogram() {
+  if (!els.hoursWrap) return;
+  const buckets = usage.hoursOfDay || [];
+  if (!buckets.length) {
+    els.hoursWrap.innerHTML = "";
+    setText(els.hoursCaption, "Hour data not in this build.");
+    return;
+  }
+  const values = buckets.map((bucket) => metricValue(bucket));
+  const max = Math.max(...values, 1);
+  const total = values.reduce((a, b) => a + b, 0);
+  const peakHour = values.indexOf(Math.max(...values));
+  const bars = buckets.map((bucket, hour) => {
+    const value = values[hour];
+    const heightPct = (value / max) * 100;
+    const label = value > 0
+      ? `${String(hour).padStart(2, "0")}:00 · ${formatMetric(value, "full")} ${METRIC_LABEL[state.metric]}`
+      : `${String(hour).padStart(2, "0")}:00 · quiet`;
+    const tick = hour % 6 === 0 ? String(hour).padStart(2, "0") : "";
+    return `
+      <div class="hour-bar" data-hour="${tick}" title="${escapeHtml(label)}">
+        <b style="height:${heightPct}%"></b>
+      </div>
+    `;
+  }).join("");
+  els.hoursWrap.innerHTML = bars;
+  if (total > 0) {
+    setText(
+      els.hoursCaption,
+      `Peak hour: ${String(peakHour).padStart(2, "0")}:00 · ${formatMetric(values[peakHour])} ${METRIC_LABEL[state.metric]}`,
+    );
+  } else {
+    setText(els.hoursCaption, "No counted activity in any hour yet.");
+  }
+}
+
+function updateSubagentShare(days) {
+  if (!els.subagentWrap) return;
+  const rangeTotal = days.reduce((acc, day) => acc + metricValue(day), 0);
+  const subagentTotal = days.reduce(
+    (acc, day) => acc + metricValue(day.subagentUsage || {}),
+    0,
+  );
+  const mainTotal = Math.max(rangeTotal - subagentTotal, 0);
+  if (rangeTotal <= 0) {
+    els.subagentWrap.innerHTML = "";
+    setText(els.subagentCaption, "No counted Claude activity in range.");
+    return;
+  }
+  const subagentPct = (subagentTotal / rangeTotal) * 100;
+  const mainPct = (mainTotal / rangeTotal) * 100;
+  els.subagentWrap.innerHTML = `
+    <div class="subagent-bar" title="${escapeHtml(`Subagents: ${formatMetric(subagentTotal, "full")}`)}">
+      <b style="width:${subagentPct.toFixed(1)}%"></b>
+    </div>
+    <div class="subagent-stats">
+      <div>
+        <span>Subagent</span>
+        <strong>${formatMetric(subagentTotal)}</strong>
+        <small>${subagentPct < 1 && subagentTotal > 0 ? "<1" : Math.round(subagentPct)}%</small>
+      </div>
+      <div>
+        <span>Main thread</span>
+        <strong>${formatMetric(mainTotal)}</strong>
+        <small>${mainPct < 1 && mainTotal > 0 ? "<1" : Math.round(mainPct)}%</small>
+      </div>
+    </div>
+  `;
+  setText(
+    els.subagentCaption,
+    subagentTotal > 0
+      ? `Subagent share of ${METRIC_LABEL[state.metric]} (Claude only).`
+      : "No subagent activity counted in this range.",
+  );
+}
+
 function render() {
   const days = getRangeDays();
   state.hoveredIndex = null;
@@ -1226,6 +1377,9 @@ function render() {
   updateModelMix(days);
   updateCapture(days);
   updateTable(days);
+  updateHeatmap(days);
+  updateHoursHistogram();
+  updateSubagentShare(days);
   drawChart();
 }
 
