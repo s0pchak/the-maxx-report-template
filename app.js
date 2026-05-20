@@ -1363,7 +1363,6 @@ function updateTooltip(days) {
   const day = days[state.hoveredIndex];
   const chartRect = els.chart.getBoundingClientRect();
   const left = Math.min(Math.max(state.pointerX || chartRect.width / 2, 190), chartRect.width - 190);
-  const top = Math.min(Math.max(state.pointerY || 80, 130), chartRect.height - 28);
   const rows = [...visibleModels(day.models || [])]
     .sort((a, b) => metricValue(b) - metricValue(a))
     .slice(0, 5)
@@ -1379,8 +1378,6 @@ function updateTooltip(days) {
     .join("");
 
   els.tooltip.hidden = false;
-  els.tooltip.style.left = `${left}px`;
-  els.tooltip.style.top = `${top}px`;
   els.tooltip.innerHTML = `
     <span class="tip-date">${formatDateLong(day.date)}</span>
     <strong class="tip-total">${formatMetric(metricValue(day), "full")} ${METRIC_LABEL[state.metric]}</strong>
@@ -1390,6 +1387,23 @@ function updateTooltip(days) {
     </div>
     <div class="tip-models">${rows}</div>
   `;
+
+  // Place above the pointer by default, but flip below when a tall peak leaves
+  // no room above (the chart clips overflow, which was cutting the tooltip off).
+  const margin = 14;
+  const pointerY = state.pointerY || 80;
+  const tipHeight = els.tooltip.offsetHeight;
+  const flipBelow = pointerY - tipHeight - margin < 0;
+  let top;
+  if (flipBelow) {
+    top = Math.min(pointerY, chartRect.height - tipHeight - margin);
+    els.tooltip.style.transform = `translate(-50%, ${margin}px)`;
+  } else {
+    top = pointerY;
+    els.tooltip.style.transform = `translate(-50%, calc(-100% - ${margin}px))`;
+  }
+  els.tooltip.style.left = `${left}px`;
+  els.tooltip.style.top = `${Math.max(top, 0)}px`;
 }
 
 function updateTable(days) {
