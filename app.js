@@ -12,11 +12,137 @@ const usage = window.AI_TOKEN_USAGE || window.CODEX_TOKEN_USAGE || {
 
 const state = {
   range: "all",
+  metric: "output",
   hoveredIndex: null,
   pointerX: 0,
   pointerY: 0,
   chartGeometry: null,
 };
+
+const METRIC_LABEL = {
+  output: "output tokens",
+  new: "new tokens (excl. cache reads)",
+  total: "total tokens (incl. cache reads)",
+  cost: "estimated USD",
+};
+
+const METRIC_SHORT = {
+  output: "output",
+  new: "new",
+  total: "total",
+  cost: "cost",
+};
+
+const PRICING = window.AI_PRICING || { default: { input: 0, cacheRead: 0, output: 0 }, models: {} };
+const PLAN = window.AI_PLAN || { usdPerMonth: 0, label: "" };
+
+function planCostForRange(days) {
+  const perMonth = Number(PLAN.usdPerMonth || 0);
+  if (!perMonth || !days?.length) return 0;
+  return (perMonth / 30) * days.length;
+}
+
+function formatMultiplier(value) {
+  if (!Number.isFinite(value)) return "--";
+  if (value >= 100) return `${Math.round(value)}x`;
+  if (value >= 10) return `${value.toFixed(0)}x`;
+  return `${value.toFixed(1)}x`;
+}
+const pricingCache = new Map();
+
+function lookupPricing(modelName) {
+  if (!modelName) return PRICING.default;
+  if (pricingCache.has(modelName)) return pricingCache.get(modelName);
+  const models = PRICING.models || {};
+  const lower = String(modelName).toLowerCase();
+  let hit = models[modelName] || models[lower];
+  if (!hit) {
+    let bestKey = null;
+    for (const key of Object.keys(models)) {
+      const keyLower = key.toLowerCase();
+      if (lower.startsWith(keyLower) && (!bestKey || keyLower.length > bestKey.length)) {
+        bestKey = keyLower;
+        hit = models[key];
+      }
+    }
+  }
+  const resolved = hit || PRICING.default;
+  pricingCache.set(modelName, resolved);
+  return resolved;
+}
+
+function costForUsage(usage = {}, pricing = PRICING.default) {
+  const inputRate = Number(pricing.input || 0);
+  const cacheReadRate = Number(pricing.cacheRead || 0);
+  const cacheWriteRate = pricing.cacheWrite != null
+    ? Number(pricing.cacheWrite)
+    : inputRate * 1.25;
+  const outputRate = Number(pricing.output || 0);
+  const fresh = Number(usage.freshInputTokens || 0);
+  const cacheCreation = Number(usage.cacheCreationTokens || 0);
+  const rawInput = Math.max(fresh - cacheCreation, 0);
+  const cacheRead = Number(usage.cachedInputTokens || 0);
+  const output = Number(usage.outputTokens || 0) + Number(usage.reasoningOutputTokens || 0);
+  return (
+    rawInput * inputRate
+    + cacheCreation * cacheWriteRate
+    + cacheRead * cacheReadRate
+    + output * outputRate
+  ) / 1_000_000;
+}
+
+function costForModelRow(row = {}) {
+  return costForUsage(row, lookupPricing(row.name));
+}
+
+function costForDay(day = {}) {
+  const models = day.models || [];
+  if (models.length) {
+    return models.reduce((acc, model) => acc + costForModelRow(model), 0);
+  }
+  return costForUsage(day, PRICING.default);
+}
+
+function costForTotals(totals, days) {
+  if (Array.isArray(days)) {
+    return days.reduce((acc, day) => acc + costForDay(day), 0);
+  }
+  return costForUsage(totals, PRICING.default);
+}
+
+function metricValue(thing = {}, metric = state.metric) {
+  if (metric === "cost") {
+    if (Array.isArray(thing?.models) && thing.models.length) return costForDay(thing);
+    if (thing && typeof thing.name === "string") return costForModelRow(thing);
+    return costForUsage(thing, PRICING.default);
+  }
+  if (metric === "output") {
+    return Number(thing.outputTokens || 0) + Number(thing.reasoningOutputTokens || 0);
+  }
+  if (metric === "new") {
+    return (
+      Number(thing.freshInputTokens || 0)
+      + Number(thing.outputTokens || 0)
+      + Number(thing.reasoningOutputTokens || 0)
+    );
+  }
+  return Number(thing.totalTokens || 0);
+}
+
+const usdFull = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" });
+const usdCompact = new Intl.NumberFormat("en-US", {
+  style: "currency",
+  currency: "USD",
+  notation: "compact",
+  maximumFractionDigits: 2,
+});
+
+function formatMetric(value, mode = "compact") {
+  if (state.metric === "cost") {
+    return mode === "full" ? usdFull.format(value) : usdCompact.format(value);
+  }
+  return mode === "full" ? fullNumber(value) : compactNumber(value);
+}
 
 const modelPalette = [
   "#5ff0b2",
@@ -56,7 +182,9 @@ const els = {
   modelMix: document.querySelector("#modelMix"),
   captureMeta: document.querySelector("#captureMeta"),
   heroTotal: document.querySelector("#heroTotal"),
+  heroTotalUnit: document.querySelector("#heroTotalUnit"),
   heroCaption: document.querySelector("#heroCaption"),
+  planPill: document.querySelector("#planPill"),
   heroPeakTokens: document.querySelector("#heroPeakTokens"),
   heroPeakDate: document.querySelector("#heroPeakDate"),
   heroLongestDuration: document.querySelector("#heroLongestDuration"),
@@ -269,17 +397,22 @@ function sumModels(days) {
   });
   return [...byModel.entries()]
     .map(([name, totals]) => ({ name, ...totals }))
-    .sort((a, b) => b.totalTokens - a.totalTokens);
+    .sort((a, b) => metricValue(b) - metricValue(a));
 }
 
 function topModelForDay(day) {
-  return visibleModels(day.models || [])[0] || { name: "unattributed", totalTokens: 0 };
+  const models = visibleModels(day.models || []);
+  if (!models.length) return { name: "unattributed", totalTokens: 0 };
+  return [...models].sort((a, b) => metricValue(b) - metricValue(a))[0];
 }
 
 function maxDayBy(days, key) {
+  const getValue = key === "totalTokens"
+    ? (day) => metricValue(day)
+    : (day) => Number(day?.[key] || 0);
   return days.reduce((best, day) => {
-    const value = Number(day?.[key] || 0);
-    const bestValue = Number(best?.[key] || 0);
+    const value = getValue(day);
+    const bestValue = best ? getValue(best) : -Infinity;
     if (!best || value > bestValue) return day;
     if (value === bestValue && String(day?.date || "") > String(best?.date || "")) return day;
     return best;
@@ -293,7 +426,7 @@ function pluralWord(value, singular, plural = `${singular}s`) {
 function buildMoments() {
   const days = usage.days || [];
   const models = [...(usage.models || [])].sort(
-    (a, b) => Number(b.totalTokens || 0) - Number(a.totalTokens || 0),
+    (a, b) => metricValue(b) - metricValue(a),
   );
   const unknownModel = models.find((model) => model.name === "unknown");
   const unknownModelCalls = Number(
@@ -301,30 +434,30 @@ function buildMoments() {
   );
   const leader = models[0] || null;
   const runnerUp = models[1] || null;
-  const gapTokens = leader && runnerUp
-    ? Number(leader.totalTokens || 0) - Number(runnerUp.totalTokens || 0)
-    : 0;
+  const leaderValue = leader ? metricValue(leader) : 0;
+  const runnerUpValue = runnerUp ? metricValue(runnerUp) : 0;
+  const gapTokens = leader && runnerUp ? leaderValue - runnerUpValue : 0;
 
   return {
     days,
-    totalTokens: Number(usage.totals?.totalTokens || 0),
+    totalTokens: metricValue(usage.totals || {}),
     totalCalls: Number(usage.totals?.modelCalls || 0),
     peakDay: maxDayBy(days, "totalTokens"),
     longestDay: maxDayBy(days, "sessionDurationSeconds"),
     callsDay: maxDayBy(days, "modelCalls"),
-    billionDays: days.filter((day) => Number(day.totalTokens || 0) >= billionTokens),
-    halfBillionDays: days.filter((day) => Number(day.totalTokens || 0) >= halfBillionTokens),
+    billionDays: days.filter((day) => metricValue(day) >= billionTokens),
+    halfBillionDays: days.filter((day) => metricValue(day) >= halfBillionTokens),
     unknownModelCalls,
     modelRace: {
       leader,
       runnerUp,
       gapTokens,
-      gapShare: runnerUp?.totalTokens ? gapTokens / Number(runnerUp.totalTokens) : 0,
+      gapShare: runnerUpValue ? gapTokens / runnerUpValue : 0,
     },
   };
 }
 
-const moments = buildMoments();
+let moments = buildMoments();
 
 function shortDateList(days, limit = 3) {
   if (!days.length) return "none";
@@ -345,16 +478,24 @@ function modelRaceLine(race = moments.modelRace) {
 function headlineLine() {
   const peak = moments.peakDay;
   if (!peak) return "No token events yet. Suspense is cheap.";
-  return `${compactNumber(moments.totalTokens)} tokens across ${fullNumber(moments.days.length)} logged days.`;
+  return `${formatMetric(moments.totalTokens)} ${METRIC_LABEL[state.metric]} across ${fullNumber(moments.days.length)} logged days.`;
 }
 
 function incidentTone(day) {
   if (!day) return "No incident selected.";
-  if (Number(day.totalTokens || 0) >= billionTokens) {
-    return "This day cleared 1B tokens. The y-axis needed a meeting.";
+  if (state.metric === "cost") {
+    const usd = metricValue(day);
+    if (usd >= 1000) return `This day cleared four figures of model spend. The CFO ticked.`;
+    if (usd >= 250) return `This day spent more on tokens than on lunch.`;
+    if (usd >= 50) return `A solid weekday at the model meter.`;
+    return `A quiet day at the meter.`;
   }
-  if (Number(day.totalTokens || 0) >= halfBillionTokens) {
-    return "This day cleared 500M tokens and still tried to look casual.";
+  const value = metricValue(day);
+  if (value >= billionTokens) {
+    return `This day cleared 1B ${METRIC_SHORT[state.metric]} tokens. The y-axis needed a meeting.`;
+  }
+  if (value >= halfBillionTokens) {
+    return `This day cleared 500M ${METRIC_SHORT[state.metric]} tokens and still tried to look casual.`;
   }
   if (Number(day.sessionDurationSeconds || 0) >= 20 * 60 * 60) {
     return "The session length nearly ate the whole calendar square.";
@@ -374,6 +515,12 @@ function updateSelectedIncident(day = moments.peakDay, source = "Peak Day") {
 
   const top = topModelForDay(day);
   const cachedShare = percentLabel(day.cachedInputTokens, day.inputTokens);
+  const dayValue = metricValue(day);
+  const topValue = metricValue(top);
+  const tokenLabel = state.metric === "cost"
+    ? "Spend"
+    : (METRIC_SHORT[state.metric] === "total" ? "Tokens" : `${METRIC_SHORT[state.metric].replace(/^./, (c) => c.toUpperCase())} tokens`);
+  const topLabel = state.metric === "cost" ? "Top Spend" : `Top ${tokenLabel}`;
   setHtml(
     els.selectedIncident,
     `
@@ -382,11 +529,11 @@ function updateSelectedIncident(day = moments.peakDay, source = "Peak Day") {
         <strong>${formatDateLong(day.date)}</strong>
         <p>${escapeHtml(incidentTone(day))}</p>
         <dl class="incident-stats">
-          <div><dt>Tokens</dt><dd>${fullNumber(day.totalTokens)}</dd></div>
+          <div><dt>${tokenLabel}</dt><dd>${formatMetric(dayValue, "full")}</dd></div>
           <div><dt>Session</dt><dd>${durationLabel(day.sessionDurationSeconds)}</dd></div>
           <div><dt>Calls</dt><dd>${fullNumber(day.modelCalls)}</dd></div>
           <div><dt>Top Model</dt><dd>${escapeHtml(top.name)}</dd></div>
-          <div><dt>Top Tokens</dt><dd>${compactNumber(top.totalTokens)}</dd></div>
+          <div><dt>${topLabel}</dt><dd>${formatMetric(topValue)}</dd></div>
           <div><dt>Cached Input</dt><dd>${cachedShare}</dd></div>
         </dl>
       </article>
@@ -401,8 +548,8 @@ function tickerItems() {
   return [
     peak && {
       label: "Peak day",
-      value: compactNumber(peak.totalTokens),
-      detail: `${formatDate(peak.date)} carried ${fullNumber(peak.totalTokens)} tokens.`,
+      value: formatMetric(metricValue(peak)),
+      detail: `${formatDate(peak.date)} carried ${formatMetric(metricValue(peak), "full")} ${METRIC_LABEL[state.metric]}.`,
     },
     longest && {
       label: "Longest session",
@@ -467,13 +614,19 @@ function achievementItems() {
 
   return [
     {
-      title: "Total Stack",
-      value: compactNumber(moments.totalTokens),
-      detail: "The receipt has reached budget-review length.",
+      title: state.metric === "output"
+        ? "Output Stack"
+        : state.metric === "new"
+          ? "New-Tokens Stack"
+          : state.metric === "cost"
+            ? "Approx. Spend"
+            : "Total Stack",
+      value: formatMetric(moments.totalTokens),
+      detail: `The receipt is measured in ${METRIC_LABEL[state.metric]}.`,
     },
     peak && {
       title: "Peak Day",
-      value: compactNumber(peak.totalTokens),
+      value: formatMetric(metricValue(peak)),
       detail: `${formatDateLong(peak.date)} put the chart on notice.`,
     },
     longest && {
@@ -536,10 +689,26 @@ function updateHeroReceipts() {
   const peak = moments.peakDay;
   const longest = moments.longestDay;
   const calls = moments.callsDay;
+  const rangeDays = getRangeDays();
 
-  setText(els.heroTotal, compactNumber(moments.totalTokens));
+  setText(els.heroTotal, formatMetric(moments.totalTokens));
+  setText(els.heroTotalUnit, state.metric === "cost" ? "in model spend (approx.)" : METRIC_LABEL[state.metric]);
+
+  if (els.planPill) {
+    const perMonth = Number(PLAN.usdPerMonth || 0);
+    if (state.metric === "cost" && perMonth > 0 && rangeDays.length > 0) {
+      const rangeCost = rangeDays.reduce((acc, day) => acc + metricValue(day, "cost"), 0);
+      const planCost = planCostForRange(rangeDays);
+      const ratio = planCost > 0 ? rangeCost / planCost : 0;
+      const planLabel = PLAN.label || "plan";
+      els.planPill.textContent = `${formatMultiplier(ratio)} your ${usdFull.format(perMonth)}/mo ${planLabel}`;
+      els.planPill.hidden = false;
+    } else {
+      els.planPill.hidden = true;
+    }
+  }
   setText(els.heroCaption, headlineLine());
-  setText(els.heroPeakTokens, peak ? compactNumber(peak.totalTokens) : "--");
+  setText(els.heroPeakTokens, peak ? formatMetric(metricValue(peak)) : "--");
   setText(els.heroPeakDate, peak ? formatDateLong(peak.date) : "--");
   setText(
     els.heroLongestDuration,
@@ -563,8 +732,11 @@ function updatePersonalityLayer() {
 function updateSummary() {
   const days = usage.days || [];
   const latest = days.at(-1);
-  const topModel = (usage.models || [])[0];
-  const totalTokens = Number(usage.totals?.totalTokens || 0);
+  const sortedModels = [...(usage.models || [])].sort(
+    (a, b) => metricValue(b) - metricValue(a),
+  );
+  const topModel = sortedModels[0];
+  const totalTokens = metricValue(usage.totals || {});
 
   setText(els.generatedDate, formatGeneratedDate(usage.generatedAt));
   setText(els.generatedTime, formatGeneratedTime(usage.generatedAt));
@@ -573,29 +745,32 @@ function updateSummary() {
     setText(els.ownerHandle, ownerHandle);
     els.ownerHandle.hidden = !ownerHandle;
   }
-  setText(els.totalTokens, compactNumber(totalTokens));
+  setText(els.totalTokens, formatMetric(totalTokens));
   setText(els.dateSpan, `${formatDateLong(usage.firstDate)} to ${formatDateLong(usage.lastDate)}`);
-  setText(els.todayTokens, latest ? compactNumber(latest.totalTokens) : "--");
+  setText(els.todayTokens, latest ? formatMetric(metricValue(latest)) : "--");
   setText(els.todayCalls, latest ? `${fullNumber(latest.modelCalls)} calls` : "--");
   setText(els.durationValue, latest ? durationLabel(latest.sessionDurationSeconds) : "--");
   setText(els.durationDate, latest ? formatDateLong(latest.date) : "--");
   setText(els.topModel, topModel ? topModel.name : "--");
   setText(
     els.topModelShare,
-    topModel ? `${percentLabel(topModel.totalTokens, totalTokens)} of total` : "--",
+    topModel ? `${percentLabel(metricValue(topModel), totalTokens)} of ${METRIC_SHORT[state.metric]}` : "--",
   );
 }
 
 function updateModelMix(days) {
   const modelRows = sumModels(days);
-  const total = sumDays(days).totalTokens;
+  const total = state.metric === "cost"
+    ? modelRows.reduce((acc, m) => acc + metricValue(m), 0)
+    : metricValue(sumDays(days));
 
   setHtml(
     els.modelMix,
     modelRows
       .slice(0, 8)
       .map((model) => {
-        const width = total ? Math.max((model.totalTokens / total) * 100, 1) : 0;
+        const value = metricValue(model);
+        const width = total ? Math.max((value / total) * 100, 1) : 0;
         const provider = providerLabel(model);
         return `
           <div class="model-row">
@@ -604,10 +779,10 @@ function updateModelMix(days) {
                 <i style="background:${colorForModel(model.name)}"></i>
                 <span class="model-label">${escapeHtml(model.name)}</span>
               </span>
-              <strong>${compactNumber(model.totalTokens)}</strong>
+              <strong>${formatMetric(value)}</strong>
             </div>
             <div class="track"><b style="width:${width}%; background:${colorForModel(model.name)}"></b></div>
-            <small>${provider ? `${escapeHtml(provider)} &middot; ` : ""}${percentLabel(model.totalTokens, total)} &middot; ${fullNumber(model.modelCalls)} calls</small>
+            <small>${provider ? `${escapeHtml(provider)} &middot; ` : ""}${percentLabel(value, total)} &middot; ${fullNumber(model.modelCalls)} calls</small>
           </div>
         `;
       })
@@ -762,7 +937,7 @@ function drawChart() {
   const plotH = Math.max(height - pad.top - pad.bottom, 1);
   const step = plotW / days.length;
   const columnWidth = Math.max(Math.min(step * 0.62, compact ? 14 : 22), days.length > 80 ? 2 : 5);
-  const maxTokens = Math.max(...days.map((day) => day.totalTokens || 0), 1);
+  const maxTokens = Math.max(...days.map((day) => metricValue(day)), 1);
   const tokenMax = Math.max(maxTokens * 1.08, 1);
   const maxDuration = Math.max(...days.map((day) => day.sessionDurationSeconds || 0), 60 * 60);
   const durationMax = Math.max(maxDuration, 24 * 60 * 60);
@@ -811,7 +986,7 @@ function drawChart() {
     ctx.moveTo(pad.left, y);
     ctx.lineTo(width - pad.right, y);
     ctx.stroke();
-    ctx.fillText(compactNumber(tokenValue), pad.left - 10, y);
+    ctx.fillText(formatMetric(tokenValue), pad.left - 10, y);
   }
 
   [halfBillionTokens, billionTokens].forEach((threshold) => {
@@ -847,7 +1022,8 @@ function drawChart() {
     ctx.restore();
 
     orderedModels.forEach((modelName) => {
-      const value = Number(modelMap.get(modelName)?.totalTokens || 0);
+      const modelEntry = modelMap.get(modelName);
+      const value = modelEntry ? metricValue(modelEntry) : 0;
       if (!value) return;
       const segmentHeight = Math.max((value / tokenMax) * plotH, 1.25);
       yBase -= segmentHeight;
@@ -926,7 +1102,8 @@ function drawChart() {
   const peakIndex = days.findIndex((day) => day.date === rangePeakDay?.date);
   if (!compact && peakIndex >= 0 && rangePeakDay) {
     const day = days[peakIndex];
-    drawPillLabel(ctx, `Most tokens: ${compactNumber(day.totalTokens)}`, recordBounds.right, recordBounds.top + 18, {
+    const label = state.metric === "cost" ? "Most spend" : `Most ${METRIC_SHORT[state.metric]}`;
+    drawPillLabel(ctx, `${label}: ${formatMetric(metricValue(day))}`, recordBounds.right, recordBounds.top + 18, {
       align: "right",
       color: "#d7ff45",
       background: "rgba(8, 10, 10, 0.88)",
@@ -973,7 +1150,7 @@ function drawChart() {
     ctx.fillText(formatDate(days[index].date), x, height - 28);
   }
 
-  setText(els.rangeCaption, `${fullNumber(days.length)} days | Session length: first token to last token each day`);
+  setText(els.rangeCaption, `${fullNumber(days.length)} days | bars = ${METRIC_LABEL[state.metric]}`);
   els.rangeCaption.title = "Session length is the time between the first counted token event and the last counted token event in each local day.";
   updateTooltip(days);
 }
@@ -988,14 +1165,15 @@ function updateTooltip(days) {
   const chartRect = els.chart.getBoundingClientRect();
   const left = Math.min(Math.max(state.pointerX || chartRect.width / 2, 190), chartRect.width - 190);
   const top = Math.min(Math.max(state.pointerY || 80, 130), chartRect.height - 28);
-  const rows = visibleModels(day.models || [])
+  const rows = [...visibleModels(day.models || [])]
+    .sort((a, b) => metricValue(b) - metricValue(a))
     .slice(0, 5)
     .map(
       (model) => `
         <span class="tip-row" title="${escapeHtml(modelTitle(model))}">
           <i style="background:${colorForModel(model.name)}"></i>
           <em>${escapeHtml(model.name)}</em>
-          <b>${compactNumber(model.totalTokens)}</b>
+          <b>${formatMetric(metricValue(model))}</b>
         </span>
       `,
     )
@@ -1006,7 +1184,7 @@ function updateTooltip(days) {
   els.tooltip.style.top = `${top}px`;
   els.tooltip.innerHTML = `
     <span class="tip-date">${formatDateLong(day.date)}</span>
-    <strong class="tip-total">${fullNumber(day.totalTokens)} tokens</strong>
+    <strong class="tip-total">${formatMetric(metricValue(day), "full")} ${METRIC_LABEL[state.metric]}</strong>
     <div class="tip-metrics">
       <span><b>${durationLabel(day.sessionDurationSeconds)}</b><em>session length</em></span>
       <span><b>${fullNumber(day.modelCalls)}</b><em>calls</em></span>
@@ -1027,10 +1205,10 @@ function updateTable(days) {
         return `
           <tr data-date="${day.date}">
             <td>${formatDateLong(day.date)}</td>
-            <td>${fullNumber(day.totalTokens)}</td>
+            <td>${formatMetric(metricValue(day), "full")}</td>
             <td>${durationLabel(day.sessionDurationSeconds)}</td>
             <td><span class="table-model"><i style="background:${colorForModel(top.name)}"></i>${escapeHtml(top.name)}</span></td>
-            <td>${fullNumber(top.totalTokens)}</td>
+            <td>${formatMetric(metricValue(top), "full")}</td>
             <td>${fullNumber(day.modelCalls)}</td>
           </tr>
         `;
@@ -1042,6 +1220,7 @@ function updateTable(days) {
 function render() {
   const days = getRangeDays();
   state.hoveredIndex = null;
+  moments = buildMoments();
   updatePersonalityLayer();
   updateSummary();
   updateModelMix(days);
@@ -1055,6 +1234,15 @@ document.querySelectorAll("[data-range]").forEach((button) => {
     document.querySelectorAll("[data-range]").forEach((btn) => btn.classList.remove("active"));
     button.classList.add("active");
     state.range = button.dataset.range;
+    render();
+  });
+});
+
+document.querySelectorAll("[data-metric]").forEach((button) => {
+  button.addEventListener("click", () => {
+    document.querySelectorAll("[data-metric]").forEach((btn) => btn.classList.remove("active"));
+    button.classList.add("active");
+    state.metric = button.dataset.metric;
     render();
   });
 });

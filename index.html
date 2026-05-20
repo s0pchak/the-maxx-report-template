@@ -30,8 +30,9 @@
         <div class="hero-copy">
           <p class="eyebrow">The Maxx Report</p>
           <div class="hero-title">
-            <h1><span id="heroTotal">--</span> tokens</h1>
+            <h1><span id="heroTotal">--</span> <span id="heroTotalUnit">output tokens</span></h1>
             <span class="hero-owner" id="ownerHandle" hidden></span>
+            <span class="plan-pill" id="planPill" hidden></span>
           </div>
           <div class="hero-actions">
             <div class="hero-tagline-row">
@@ -67,7 +68,13 @@
               <h2>Daily Token Load</h2>
               <p id="rangeCaption">--</p>
             </div>
-            <div class="controls" aria-label="Range">
+            <div class="controls" aria-label="Range and metric">
+              <div class="segmented" role="group" aria-label="Metric">
+                <button type="button" class="active" data-metric="output" title="Tokens Claude actually generated. Full price. The honest number.">Output</button>
+                <button type="button" data-metric="new" title="Output + fresh input + cache creation. Excludes cache reads.">New</button>
+                <button type="button" data-metric="total" title="Everything including cache reads. Inflated by 1M-context cache replays.">Total</button>
+                <button type="button" data-metric="cost" title="Approximate USD spend per day using data/pricing.js rates.">$ Cost</button>
+              </div>
               <div class="segmented" role="group" aria-label="Range">
                 <button type="button" class="active" data-range="all">All</button>
                 <button type="button" data-range="45">45d</button>
@@ -92,6 +99,7 @@
     </main>
 
     <script src="./data/usage.js"></script>
+    <script src="./data/pricing.js"></script>
     <script src="./app.js"></script>
   </body>
 </html>
