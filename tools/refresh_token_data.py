@@ -822,11 +822,12 @@ def _top_key(tally: dict[str, int]) -> str:
     return max(tally.items(), key=lambda kv: kv[1])[0] if tally else ""
 
 
-def compute_sessions(events: list[UsageEvent], gap_seconds: int) -> list[dict]:
-    """Group events into continuous sessions, splitting whenever the silent
-    gap between consecutive events exceeds gap_seconds. Sessions span midnight
-    and ignore in-session resets like /clear (no gap = same session). Each
-    session also tracks its dominant model and project (by token volume)."""
+def compute_sessions(events: list[UsageEvent], gap_seconds: int, split_by_project: bool = True) -> list[dict]:
+    """Group events into continuous sessions. A session ends when the silent
+    gap between consecutive events exceeds gap_seconds, or (when
+    split_by_project) when the working project changes — so a session is
+    continuous work on one project. Sessions span midnight and ignore in-session
+    resets like /clear. Each session tracks its dominant model and project."""
     if not events:
         return []
     ordered = sorted(events, key=lambda event: event.timestamp)
@@ -839,6 +840,7 @@ def compute_sessions(events: list[UsageEvent], gap_seconds: int) -> list[dict]:
             "calls": 0,
             "models": {},
             "projects": {},
+            "project": event.project or "",
         }
 
     def absorb(session: dict, event: UsageEvent) -> None:
@@ -850,12 +852,21 @@ def compute_sessions(events: list[UsageEvent], gap_seconds: int) -> list[dict]:
             session["models"][event.model] = session["models"].get(event.model, 0) + value
         if event.project:
             session["projects"][event.project] = session["projects"].get(event.project, 0) + value
+            if not session["project"]:
+                session["project"] = event.project
 
     sessions: list[dict] = []
     current = fresh(ordered[0])
     absorb(current, ordered[0])
     for event in ordered[1:]:
-        if (event.timestamp - current["end"]).total_seconds() > gap_seconds:
+        gap_break = (event.timestamp - current["end"]).total_seconds() > gap_seconds
+        project_break = (
+            split_by_project
+            and bool(event.project)
+            and bool(current["project"])
+            and event.project != current["project"]
+        )
+        if gap_break or project_break:
             sessions.append(current)
             current = fresh(event)
         absorb(current, event)
@@ -922,6 +933,31 @@ def summarize_sessions(sessions: list[dict], gap_seconds: int, local_tz: ZoneInf
     }
 
 
+def project_session_rows(events: list[UsageEvent], gap_seconds: int, local_tz: ZoneInfo) -> list[dict]:
+    """Sessionize each project's events independently (gap only). Returns one
+    row per per-project session for the history timeline, so concurrent work on
+    different repos lands in separate rows rather than a single mixed block."""
+    by_project: dict[str, list[UsageEvent]] = {}
+    for event in events:
+        by_project.setdefault(event.project or "", []).append(event)
+
+    rows: list[dict] = []
+    for project, project_events in by_project.items():
+        for session in compute_sessions(project_events, gap_seconds, split_by_project=False):
+            rows.append({
+                "start": session["start"].astimezone(local_tz).isoformat(),
+                "end": session["end"].astimezone(local_tz).isoformat(),
+                "startDate": session["start"].astimezone(local_tz).date().isoformat(),
+                "durationSeconds": int((session["end"] - session["start"]).total_seconds()),
+                "totalTokens": int(session.get("tokens") or 0),
+                "modelCalls": int(session.get("calls") or 0),
+                "topModel": _top_key(session.get("models") or {}),
+                "project": project,
+            })
+    rows.sort(key=lambda row: row["start"])
+    return rows
+
+
 def build_usage() -> dict:
     local_tz = get_local_tz()
     codex_sources = get_codex_source_dirs()
@@ -933,9 +969,16 @@ def build_usage() -> dict:
     all_events = [*codex_events, *claude_events, *opencode_events]
 
     session_gap_seconds = get_session_gap_seconds()
-    sessions = compute_sessions(all_events, session_gap_seconds)
+    # Global sessions are activity-union (gap only): used for per-day active time
+    # and the longest-session highlight, with no double counting across parallel
+    # projects.
+    sessions = compute_sessions(all_events, session_gap_seconds, split_by_project=False)
     active_by_day = active_seconds_by_day(sessions, local_tz)
     session_summary = summarize_sessions(sessions, session_gap_seconds, local_tz)
+    # Per-project sessions for the history timeline: each project's events are
+    # sessionized independently so concurrent work on different repos shows as
+    # separate lanes instead of shredding into micro-sessions.
+    session_summary["byProject"] = project_session_rows(all_events, session_gap_seconds, local_tz)
 
     # Per-day Codex records so the dashboard can take the max over any range.
     concurrency_by_day = peak_concurrent_by_day(get_codex_logs_db_path(), local_tz)
@@ -1085,7 +1128,7 @@ def build_usage() -> dict:
             "modelField": "Codex nearest prior turn_context.payload.model within each session transcript; Claude message.model; OpenCode message.modelID.",
             "dedupe": "Codex counts repeated total_token_usage.total_tokens once per session file. Claude keeps one row per transcript path and message.id, choosing the largest token total and latest timestamp on ties. OpenCode reads one row per assistant message (the table is keyed by message id).",
             "forkHandling": "Codex forked/subagent sessions skip token_count events in the first two seconds to avoid copied parent history. Claude subagents/sidechains are included. OpenCode includes all assistant messages with non-zero tokens.",
-            "sessionDuration": f"Continuous sessions: events across all providers are sorted by time, and a silent gap longer than DASHBOARD_SESSION_GAP_MINUTES ({session_summary['gapMinutes']}m default 120m) starts a new session. Per-day session length is the session time that falls on that local day (cross-midnight sessions are split). In-session resets like /clear do not split a session.",
+            "sessionDuration": f"Continuous sessions: events across all providers are sorted by time, and a new session starts on a silent gap longer than DASHBOARD_SESSION_GAP_MINUTES ({session_summary['gapMinutes']}m default 120m). Per-day session length is the session time that falls on that local day (cross-midnight sessions are split). In-session resets like /clear do not split a session. The history timeline (sessions.byProject) sessionizes each project's events independently so concurrent work on different repos shows as separate lanes.",
             "highlights": "Aggregate-only all-time highlights. Long task-turn highlights ignore paired task events over 12 hours to avoid stale resumed tabs. Tool pileup counts tool-call response items per Codex session transcript. API street value is computed client-side from data/pricing.js.",
             "scope": "Local Codex, Claude Code, and OpenCode transcripts only; not account billing truth.",
         },

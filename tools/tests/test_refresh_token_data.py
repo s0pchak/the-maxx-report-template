@@ -239,7 +239,7 @@ class RefreshTokenDataTest(unittest.TestCase):
         self.assertEqual(refresh_token_data.project_name(""), "")
         self.assertEqual(refresh_token_data.project_name(None), "")
 
-    def test_sessions_track_dominant_model_and_project(self):
+    def test_sessions_split_by_project_and_track_dominant_model(self):
         base = datetime(2026, 3, 1, 9, 0, 0, tzinfo=timezone.utc)
         usage = {**refresh_token_data.empty_day(), "totalTokens": 100}
 
@@ -248,21 +248,29 @@ class RefreshTokenDataTest(unittest.TestCase):
                 "claude", base + timedelta(minutes=minute), model, usage, project=project
             )
 
-        # One session: opus appears more than haiku; project "alpha" outweighs "beta".
+        # No gaps, but the project switches alpha -> beta, so it's two sessions.
         events = [
             event(0, "claude-opus-4-7", "alpha"),
             event(10, "claude-opus-4-7", "alpha"),
             event(20, "claude-haiku-4-5", "beta"),
         ]
-        sessions = refresh_token_data.compute_sessions(events, gap_seconds=120 * 60)
-        summary = refresh_token_data.summarize_sessions(sessions, 120 * 60, refresh_token_data.get_local_tz())
-        self.assertEqual(len(summary["list"]), 1)
-        row = summary["list"][0]
-        self.assertEqual(row["topModel"], "claude-opus-4-7")
-        self.assertEqual(row["topProject"], "alpha")
-        self.assertEqual(row["modelCalls"], 3)
-        self.assertIn("start", row)
-        self.assertIn("end", row)
+        split = refresh_token_data.compute_sessions(events, gap_seconds=120 * 60, split_by_project=True)
+        self.assertEqual(len(split), 2)
+        s_alpha = refresh_token_data.summarize_sessions(split, 120 * 60, refresh_token_data.get_local_tz())["list"]
+        self.assertEqual(s_alpha[0]["topProject"], "alpha")
+        self.assertEqual(s_alpha[0]["topModel"], "claude-opus-4-7")
+        self.assertEqual(s_alpha[0]["modelCalls"], 2)
+        self.assertEqual(s_alpha[1]["topProject"], "beta")
+        self.assertEqual(s_alpha[1]["modelCalls"], 1)
+
+        # Opting out keeps it a single mixed-project session (gap-only).
+        merged = refresh_token_data.compute_sessions(events, gap_seconds=120 * 60, split_by_project=False)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["calls"], 3)
+
+        # Unknown-project events do not force a split.
+        with_unknown = [event(0, "claude-opus-4-7", "alpha"), event(5, "claude-opus-4-7", "")]
+        self.assertEqual(len(refresh_token_data.compute_sessions(with_unknown, 120 * 60, split_by_project=True)), 1)
 
     def test_codex_highlights_scan_logs_and_task_turns_without_private_ids(self):
         with tempfile.TemporaryDirectory() as tmp:

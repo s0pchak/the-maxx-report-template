@@ -1719,7 +1719,9 @@ const DOW_SHORT = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
 function updateSessionHistory() {
   if (!els.historyScroll) return;
-  const sessions = (usage.sessions?.list || []).filter((s) => Number(s.durationSeconds || 0) >= 0 && s.start);
+  // Per-project sessions: one row per (day, project) so concurrent work on
+  // different repos shows as separate lanes under the same day.
+  const sessions = (usage.sessions?.byProject || []).filter((s) => s.start);
   if (!sessions.length) {
     els.historyScroll.innerHTML = "<p class=\"history-empty\">No sessions recorded yet.</p>";
     setText(els.historyCaption, "No sessions yet.");
@@ -1731,46 +1733,56 @@ function updateSessionHistory() {
   // projects get the most distinct palette slots (and the legend matches).
   const projectTokens = new Map();
   sessions.forEach((s) => {
-    const key = s.topProject || "unknown";
+    const key = s.project || "unknown";
     projectTokens.set(key, (projectTokens.get(key) || 0) + Number(s.totalTokens || 0));
   });
   const rankedProjects = [...projectTokens.entries()].sort((a, b) => b[1] - a[1]);
   rankedProjects.forEach(([name]) => colorForProject(name === "unknown" ? "" : name));
 
-  // Group session segments by local day.
+  // day -> project -> segments
   const byDay = new Map();
   sessions.forEach((session, index) => {
+    const project = session.project || "unknown";
     sessionDaySegments(session).forEach((seg) => {
-      if (!byDay.has(seg.dateKey)) byDay.set(seg.dateKey, []);
-      byDay.get(seg.dateKey).push({ ...seg, session, index });
+      if (!byDay.has(seg.dateKey)) byDay.set(seg.dateKey, new Map());
+      const projectMap = byDay.get(seg.dateKey);
+      if (!projectMap.has(project)) projectMap.set(project, []);
+      projectMap.get(project).push({ ...seg, index });
     });
   });
 
+  const segSpan = (segs) => segs.reduce((acc, seg) => acc + (seg.to - seg.from), 0);
   const dayKeys = [...byDay.keys()].sort().reverse(); // newest first
-  const rows = dayKeys.map((dateKey) => {
+  const rows = [];
+  dayKeys.forEach((dateKey) => {
     const date = new Date(`${dateKey}T12:00:00`);
-    const blocks = byDay.get(dateKey)
-      .sort((a, b) => a.from - b.from)
-      .map((seg) => {
-        const left = (seg.from / 86400) * 100;
-        const width = Math.max(((seg.to - seg.from) / 86400) * 100, 0.4);
-        const color = colorForProject(seg.session.topProject);
-        return `<div class="history-block" style="left:${left}%;width:${width}%;background:${color}" data-i="${seg.index}"></div>`;
-      })
-      .join("");
-    return `
-      <div class="history-day">
-        <span class="history-date">${DOW_SHORT[date.getDay()]} ${formatDate(dateKey)}</span>
-        <div class="history-track">${blocks}</div>
-      </div>
-    `;
-  }).join("");
-  els.historyScroll.innerHTML = rows;
+    const projectMap = byDay.get(dateKey);
+    const projects = [...projectMap.keys()].sort((a, b) => segSpan(projectMap.get(b)) - segSpan(projectMap.get(a)));
+    projects.forEach((project, lane) => {
+      const color = colorForProject(project === "unknown" ? "" : project);
+      const blocks = projectMap.get(project)
+        .sort((a, b) => a.from - b.from)
+        .map((seg) => {
+          const left = (seg.from / 86400) * 100;
+          const width = Math.max(((seg.to - seg.from) / 86400) * 100, 0.5);
+          return `<div class="history-block" style="left:${left}%;width:${width}%;background:${color}" data-i="${seg.index}"></div>`;
+        })
+        .join("");
+      rows.push(`
+        <div class="history-row">
+          <span class="history-date">${lane === 0 ? `${DOW_SHORT[date.getDay()]} ${formatDate(dateKey)}` : ""}</span>
+          <span class="history-proj" title="${escapeHtml(project)}"><i style="background:${color}"></i>${escapeHtml(project)}</span>
+          <div class="history-track">${blocks}</div>
+        </div>
+      `);
+    });
+  });
+  els.historyScroll.innerHTML = rows.join("");
   els.historyScroll._sessions = sessions;
 
   setText(
     els.historyCaption,
-    `${fullNumber(sessions.length)} sessions across ${fullNumber(dayKeys.length)} days · 2h+ gap = new session · color = project`,
+    `${fullNumber(sessions.length)} project-sessions across ${fullNumber(dayKeys.length)} days · 2h+ gap = new session · one lane per project`,
   );
 
   if (els.historyLegend) {
@@ -1790,7 +1802,7 @@ function showHistoryTip(block) {
   const startClock = String(session.start).slice(11, 16);
   const endClock = String(session.end).slice(11, 16);
   els.historyTip.innerHTML = `
-    <span class="tip-dow">${DOW_SHORT[date.getDay()]} · ${session.topProject || "unknown project"}</span>
+    <span class="tip-dow">${DOW_SHORT[date.getDay()]} · ${escapeHtml(session.project || session.topProject || "unknown project")}</span>
     <span class="tip-date">${startClock}–${endClock} · ${durationLabel(session.durationSeconds)}</span>
     <span class="tip-value">${compactNumber(session.totalTokens)} tokens · ${session.topModel || "—"}</span>
     <span class="tip-sub">${fullNumber(session.modelCalls)} calls</span>
