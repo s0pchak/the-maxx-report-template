@@ -157,6 +157,11 @@ class RefreshTokenDataTest(unittest.TestCase):
         for day in usage["days"]:
             self.assertIn("subagentUsage", day)
             self.assertIn("hours", day)
+            # Per-day fields the dashboard maxes over the selected range.
+            self.assertIn("peakConcurrentTerminals", day)
+            self.assertIn("longestTaskTurnSeconds", day)
+            self.assertIn("toolCallPileup", day)
+        self.assertIsInstance(usage["sessions"]["list"], list)
         self.assertEqual(usage["schemaVersion"], 2)
         self.assertEqual(usage["firstDate"], "2026-01-02")
         self.assertEqual(usage["lastDate"], "2026-01-03")

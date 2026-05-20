@@ -299,15 +299,18 @@ def set_model_provider(target: dict, provider_id: str) -> None:
         target["provider"] = PROVIDER_NAMES["mixed"]
 
 
-def peak_concurrent_codex_terminals(db_path: Path, local_tz: ZoneInfo, earliest_date: str | None = None) -> dict | None:
+def peak_concurrent_by_day(db_path: Path, local_tz: ZoneInfo, earliest_date: str | None = None) -> dict[str, int]:
+    """Peak concurrent Codex processes in any one hour, bucketed by local day,
+    so the dashboard can take the max over whatever date range is selected."""
     if not db_path.exists():
-        return None
+        return {}
     cutoff_ts = 0
     if earliest_date:
         parsed = parse_timestamp(f"{earliest_date}T00:00:00+00:00")
         cutoff_ts = int(parsed.timestamp()) if parsed else 0
     conn = None
     cursor = None
+    by_day: dict[str, int] = {}
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         cursor = conn.execute(
@@ -316,38 +319,36 @@ def peak_concurrent_codex_terminals(db_path: Path, local_tz: ZoneInfo, earliest_
             FROM logs
             WHERE ts >= ? AND process_uuid IS NOT NULL AND process_uuid != ''
             GROUP BY hour_ts
-            ORDER BY process_count DESC, hour_ts DESC
-            LIMIT 1
             """,
             (cutoff_ts,),
         )
-        row = cursor.fetchone()
+        for hour_ts, process_count in cursor.fetchall():
+            try:
+                day_key = datetime.fromtimestamp(int(hour_ts), timezone.utc).astimezone(local_tz).date().isoformat()
+            except (TypeError, ValueError, OSError):
+                continue
+            by_day[day_key] = max(by_day.get(day_key, 0), int(process_count))
     except sqlite3.Error:
-        return None
+        return {}
     finally:
         if cursor:
             cursor.close()
         if conn:
             conn.close()
-
-    if not row:
-        return None
-
-    hour_ts, process_count = row
-    try:
-        hour_label = datetime.fromtimestamp(int(hour_ts), timezone.utc).astimezone(local_tz).isoformat()
-    except (TypeError, ValueError, OSError):
-        return None
-    return {
-        "count": int(process_count),
-        "hour": hour_label,
-        "date": hour_label[:10],
-    }
+    return by_day
 
 
-def codex_session_records(source_dirs: list[SourceDir], local_tz: ZoneInfo) -> dict[str, dict | None]:
-    best_task_turn: tuple[int, datetime] | None = None
-    best_tool_pileup: tuple[int, datetime | None] | None = None
+def codex_session_records_by_day(source_dirs: list[SourceDir], local_tz: ZoneInfo) -> dict[str, dict]:
+    """Per-local-day Codex records: longest single task turn (seconds) and the
+    biggest tool-call pileup in one session. Bucketed by day so the dashboard
+    can take the max over whatever date range is selected."""
+    by_day: dict[str, dict] = {}
+
+    def bump(day_key: str, field: str, value: int) -> None:
+        bucket = by_day.setdefault(day_key, {"longestTaskTurnSeconds": 0, "toolCallPileup": 0})
+        if value > bucket[field]:
+            bucket[field] = value
+
     for session_file in iter_session_files(source_dirs):
         started_by_turn: dict[str, datetime] = {}
         tool_calls = 0
@@ -394,54 +395,40 @@ def codex_session_records(source_dirs: list[SourceDir], local_tz: ZoneInfo) -> d
                         duration = max(int((event_ts - started_at).total_seconds()), 0)
                         if duration > MAX_DEFENSIBLE_TASK_TURN_SECONDS:
                             continue
-                        if not best_task_turn or duration > best_task_turn[0]:
-                            best_task_turn = (duration, started_at)
-        if tool_calls and (not best_tool_pileup or tool_calls > best_tool_pileup[0]):
-            best_tool_pileup = (tool_calls, first_tool_call_at)
+                        bump(started_at.astimezone(local_tz).date().isoformat(), "longestTaskTurnSeconds", duration)
+        if tool_calls and first_tool_call_at:
+            bump(first_tool_call_at.astimezone(local_tz).date().isoformat(), "toolCallPileup", tool_calls)
 
-    task_turn = None
-    if best_task_turn:
-        local_start = best_task_turn[1].astimezone(local_tz)
-        task_turn = {
-            "durationSeconds": best_task_turn[0],
-            "date": local_start.date().isoformat(),
-        }
-
-    tool_pileup = None
-    if best_tool_pileup:
-        local_tool_start = best_tool_pileup[1].astimezone(local_tz) if best_tool_pileup[1] else None
-        tool_pileup = {
-            "count": best_tool_pileup[0],
-            "date": local_tool_start.date().isoformat() if local_tool_start else None,
-        }
-
-    return {
-        "longestTaskTurn": task_turn,
-        "toolCallPileup": tool_pileup,
-    }
+    return by_day
 
 
-def build_highlights(days: list[dict], model_rows: list[dict], codex_sources: list[SourceDir], local_tz: ZoneInfo, session_summary: dict | None = None) -> dict:
+def build_highlights(days: list[dict], session_summary: dict | None = None) -> dict:
+    """All-time highlights, derived from the per-day fields already attached to
+    `days` (peakConcurrentTerminals, longestTaskTurnSeconds, toolCallPileup) plus
+    the session summary. The dashboard recomputes range-scoped versions from the
+    same per-day fields client-side."""
     most_tokens_day = max(days, key=lambda day: int(day.get("totalTokens") or 0), default=None)
     session_summary = session_summary or {}
     longest_seconds = int(session_summary.get("longestSeconds") or 0)
     longest_date = session_summary.get("longestStartDate")
     gap_minutes = int(session_summary.get("gapMinutes") or 0)
-    peak_concurrency = peak_concurrent_codex_terminals(
-        get_codex_logs_db_path(),
-        local_tz,
-        days[0]["date"] if days else None,
-    )
-    session_records = codex_session_records(codex_sources, local_tz)
-    task_turn = session_records["longestTaskTurn"]
-    tool_pileup = session_records["toolCallPileup"]
+
+    def best_day(field: str):
+        candidate = max(days, key=lambda day: int(day.get(field) or 0), default=None)
+        if candidate and int(candidate.get(field) or 0) > 0:
+            return candidate
+        return None
+
+    concurrency_day = best_day("peakConcurrentTerminals")
+    task_turn_day = best_day("longestTaskTurnSeconds")
+    tool_pileup_day = best_day("toolCallPileup")
     return {
         "peakConcurrentTerminals": {
             "label": "Terminal swarm",
-            "value": f"{peak_concurrency['count']:,}" if peak_concurrency else "N/A",
-            "detail": "Peak Codex processes in one local hour." if peak_concurrency else "No local Codex log database found.",
-            "date": peak_concurrency["date"] if peak_concurrency else None,
-            "count": peak_concurrency["count"] if peak_concurrency else None,
+            "value": f"{int(concurrency_day['peakConcurrentTerminals']):,}" if concurrency_day else "N/A",
+            "detail": "Peak Codex processes in one local hour." if concurrency_day else "No local Codex log database found.",
+            "date": concurrency_day["date"] if concurrency_day else None,
+            "count": int(concurrency_day["peakConcurrentTerminals"]) if concurrency_day else None,
             "source": "codex_logs",
         },
         "peakDay": {
@@ -462,18 +449,18 @@ def build_highlights(days: list[dict], model_rows: list[dict], codex_sources: li
         },
         "longestTaskTurn": {
             "label": "Longest task turn",
-            "value": format_duration(task_turn["durationSeconds"]) if task_turn else "N/A",
-            "detail": f"{task_turn['date']} had one agent on the clock." if task_turn else "No paired task turn events found.",
-            "date": task_turn["date"] if task_turn else None,
-            "seconds": task_turn["durationSeconds"] if task_turn else None,
+            "value": format_duration(int(task_turn_day["longestTaskTurnSeconds"])) if task_turn_day else "N/A",
+            "detail": f"{task_turn_day['date']} had one agent on the clock." if task_turn_day else "No paired task turn events found.",
+            "date": task_turn_day["date"] if task_turn_day else None,
+            "seconds": int(task_turn_day["longestTaskTurnSeconds"]) if task_turn_day else None,
             "source": "codex_task_events",
         },
         "toolCallPileup": {
             "label": "Tool pileup",
-            "value": format_compact_number(tool_pileup["count"]) if tool_pileup else "N/A",
-            "detail": "Most tool calls packed into one session." if tool_pileup else "No tool calls found.",
-            "date": tool_pileup["date"] if tool_pileup else None,
-            "count": tool_pileup["count"] if tool_pileup else None,
+            "value": format_compact_number(int(tool_pileup_day["toolCallPileup"])) if tool_pileup_day else "N/A",
+            "detail": "Most tool calls packed into one session." if tool_pileup_day else "No tool calls found.",
+            "date": tool_pileup_day["date"] if tool_pileup_day else None,
+            "count": int(tool_pileup_day["toolCallPileup"]) if tool_pileup_day else None,
             "source": "codex_response_items",
         },
     }
@@ -862,6 +849,15 @@ def summarize_sessions(sessions: list[dict], gap_seconds: int, local_tz: ZoneInf
         "longestStartDate": longest["start"].astimezone(local_tz).date().isoformat() if longest else None,
         "medianSeconds": median_seconds,
         "totalActiveSeconds": sum(durations),
+        # Per-session start date + duration so the dashboard can find the
+        # longest session within whatever date range is selected.
+        "list": [
+            {
+                "startDate": s["start"].astimezone(local_tz).date().isoformat(),
+                "durationSeconds": int((s["end"] - s["start"]).total_seconds()),
+            }
+            for s in sessions
+        ],
     }
 
 
@@ -879,6 +875,10 @@ def build_usage() -> dict:
     sessions = compute_sessions(all_events, session_gap_seconds)
     active_by_day = active_seconds_by_day(sessions, local_tz)
     session_summary = summarize_sessions(sessions, session_gap_seconds, local_tz)
+
+    # Per-day Codex records so the dashboard can take the max over any range.
+    concurrency_by_day = peak_concurrent_by_day(get_codex_logs_db_path(), local_tz)
+    codex_records_by_day = codex_session_records_by_day(codex_sources, local_tz)
 
     by_day: dict[str, dict[str, int]] = {}
     model_totals: dict[str, dict[str, int]] = {}
@@ -931,8 +931,12 @@ def build_usage() -> dict:
                 reverse=True,
             )
         ]
+        codex_record = codex_records_by_day.get(date_key) or {}
         clean_values = {key: value for key, value in values.items() if key not in ("models", "hours")}
         clean_values["sessionDurationSeconds"] = duration
+        clean_values["peakConcurrentTerminals"] = int(concurrency_by_day.get(date_key, 0))
+        clean_values["longestTaskTurnSeconds"] = int(codex_record.get("longestTaskTurnSeconds", 0))
+        clean_values["toolCallPileup"] = int(codex_record.get("toolCallPileup", 0))
         clean_values["models"] = model_rows
         clean_values["hours"] = {str(hour): bucket for hour, bucket in sorted(values["hours"].items())}
         days.append({"date": date_key, **clean_values})
@@ -1001,7 +1005,7 @@ def build_usage() -> dict:
             "opencode": opencode_stats,
         },
     }
-    stats["highlights"] = build_highlights(days, model_rows, codex_sources, local_tz, session_summary)
+    stats["highlights"] = build_highlights(days, session_summary)
 
     return {
         "schemaVersion": 2,

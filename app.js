@@ -498,61 +498,78 @@ function buildMoments() {
 
 let moments = buildMoments();
 
-function statHighlight(key) {
-  const highlights = usage.stats?.highlights;
-  if (!highlights) return null;
-  if (Array.isArray(highlights)) {
-    return highlights.find((item) => item.key === key || item.id === key) || null;
-  }
-  return highlights[key] || null;
-}
-
-function mergeHighlight(key, fallback) {
-  const item = statHighlight(key);
-  if (!item) return fallback;
-  return {
-    ...fallback,
-    ...item,
-    label: item.label || fallback.label,
-    value: item.value || fallback.value,
-    detail: item.detail || fallback.detail,
-  };
+// Highlights are computed from the selected date range (getRangeDays), the same
+// per-day fields the importer attaches, so they track the chart's range selector
+// instead of always showing all-time records.
+function maxDayByField(days, field) {
+  return days.reduce((best, day) => {
+    const value = Number(day?.[field] || 0);
+    if (value <= 0) return best;
+    if (!best || value > Number(best[field] || 0)) return day;
+    return best;
+  }, null);
 }
 
 function buildHighlightItems() {
-  const peak = moments.peakDay;
-  const longest = moments.longestDay;
+  const days = getRangeDays();
+  const first = days[0]?.date;
+  const last = days[days.length - 1]?.date;
+
+  const street = estimateStreetValue(sumModels(days));
+  const peak = maxDayByField(days, "totalTokens");
+
+  const rangeSessions = (usage.sessions?.list || []).filter(
+    (s) => first && last && s.startDate >= first && s.startDate <= last,
+  );
+  const longestSession = rangeSessions.reduce(
+    (best, s) => (!best || Number(s.durationSeconds || 0) > Number(best.durationSeconds || 0) ? s : best),
+    null,
+  );
+  const longestSessionSeconds = longestSession ? Number(longestSession.durationSeconds || 0) : 0;
+
+  const concDay = maxDayByField(days, "peakConcurrentTerminals");
+  const taskDay = maxDayByField(days, "longestTaskTurnSeconds");
+  const toolDay = maxDayByField(days, "toolCallPileup");
+
   return [
-    mergeHighlight("streetValue", {
+    {
       label: "Street Value",
-      value: formatMoneyCompact(estimateStreetValue()),
+      value: formatMoneyCompact(street),
       detail: "API-grade tokens, rack-rate contraband.",
-    }),
-    mergeHighlight("peakConcurrentTerminals", {
+    },
+    {
       label: "Terminal Swarm",
-      value: "--",
-      detail: "Peak Codex terminals running in one hour.",
-    }),
-    mergeHighlight("peakDay", {
+      value: concDay ? fullNumber(concDay.peakConcurrentTerminals) : "N/A",
+      detail: concDay
+        ? `${formatDateLong(concDay.date)} ran the most Codex terminals at once.`
+        : "Peak Codex terminals running in one hour.",
+    },
+    {
       label: "Peak Day",
       value: peak ? compactNumber(peak.totalTokens) : "--",
       detail: peak ? `${formatDateLong(peak.date)} burned the most tokens.` : "Most tokens in one day.",
-    }),
-    mergeHighlight("longestSession", {
+    },
+    {
       label: "Longest Session",
-      value: longest ? durationHoursLabel(longest.sessionDurationSeconds) : "--",
-      detail: longest ? `${formatDateLong(longest.date)} went end-to-end.` : "First token to last token in a day.",
-    }),
-    mergeHighlight("longestTaskTurn", {
+      value: longestSessionSeconds > 0 ? durationHoursLabel(longestSessionSeconds) : "--",
+      detail: longestSession
+        ? `${formatDateLong(longestSession.startDate)} ran longest without a 2h+ break.`
+        : "Longest continuous session.",
+    },
+    {
       label: "Longest Task Turn",
-      value: "--",
-      detail: "Longest single agent run with a start and finish.",
-    }),
-    mergeHighlight("toolCallPileup", {
+      value: taskDay ? durationLabel(taskDay.longestTaskTurnSeconds) : "N/A",
+      detail: taskDay
+        ? `${formatDateLong(taskDay.date)} had one agent on the clock.`
+        : "Longest single agent run with a start and finish.",
+    },
+    {
       label: "Tool Pileup",
-      value: moments.callsDay ? fullNumber(moments.callsDay.modelCalls) : "--",
-      detail: "Most tool calls packed into one session.",
-    }),
+      value: toolDay ? fullNumber(toolDay.toolCallPileup) : "N/A",
+      detail: toolDay
+        ? `${formatDateLong(toolDay.date)} packed the most tool calls into one session.`
+        : "Most tool calls packed into one session.",
+    },
   ];
 }
 
